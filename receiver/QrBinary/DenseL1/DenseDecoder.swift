@@ -26,6 +26,8 @@ final class DenseDecoder {
         case capacityMismatch = -5
         case outOfMemory = -6
         case calibrationFailed = -7
+        /// 信噪比过低（低置信格超过四分之一），整帧放弃，不值得重试
+        case signalTooWeak = -8
 
         /// 遥测日志用的短名。日志里写裸数字（-4）事后没人看得懂，
         /// 而界面文案又太长且会变，因此单列一套稳定的机器可读名字。
@@ -38,6 +40,7 @@ final class DenseDecoder {
             case .capacityMismatch: return "capacity"
             case .outOfMemory: return "nomem"
             case .calibrationFailed: return "calib"
+            case .signalTooWeak: return "weak"
             }
         }
     }
@@ -127,8 +130,12 @@ final class DenseDecoder {
          * 跟踪态纠错失败就丢锁重来一次。跟踪态只在上一帧的四角附近开小窗精定位，
          * 手持晃动下这个起点会偏，格数越多每格像素越少，同样的角点误差占比越大——
          * 真机 N=112 的诊断包里有三帧标记为纠错失败，同样的像素做一次全图搜索
-         * 却是 18/18 整帧解出。代价只在失败帧上付（全图搜索比跟踪态贵约 5 ms），
-         * 而失败帧本来就没有产出。
+         * 却是 18/18 整帧解出。代价只在失败帧上付（全图搜索比跟踪态贵约 5 ms，
+         * 4K 下更多），而失败帧本来就没有产出。
+         *
+         * 只认 VDD_ERR_RS。信噪比过低的帧走 VDD_ERR_SIGNAL，那类帧是屏幕换帧
+         * 过渡期抓到的，数据区被新旧两帧混合污染，换个定位起点结果一样，
+         * 重试纯属白烧——4K 那一轮 11 个失败帧里有 5 个属于这一类。
          */
         if ret == VDD_ERR_RS && lock.valid != 0 {
             lock.valid = 0

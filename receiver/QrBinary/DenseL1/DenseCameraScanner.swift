@@ -37,6 +37,7 @@ private final class DecodeBox: @unchecked Sendable {
     var device: AVCaptureDevice?
     private let lock = NSLock()
     private var _grid: Int32 = DenseDecoder.gridAuto
+    private var _diagEnabled = false
     private var _wantDump = false
     private var _dumpURL: URL?
 
@@ -44,6 +45,12 @@ private final class DecodeBox: @unchecked Sendable {
     var grid: Int32 {
         get { lock.lock(); defer { lock.unlock() }; return _grid }
         set { lock.lock(); _grid = newValue; lock.unlock() }
+    }
+
+    /// 诊断模式开关。界面写、decodeQueue 与主 actor 读，加锁
+    var diagEnabled: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _diagEnabled }
+        set { lock.lock(); _diagEnabled = newValue; lock.unlock() }
     }
 
     /// 请求把下一帧原始像素落盘（现场诊断用）
@@ -280,6 +287,15 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         set { box.grid = newValue }
     }
     var resolution: ScanResolution = .hd1080p
+    /*
+     * 诊断模式。关闭时逐帧遥测与失败帧留样全部跳过——这两项在 4K 下都不便宜：
+     * 遥测每帧一次加锁 + 一条 Record（含整个 vdd_diag）入数组，留样一次要
+     * memcpy 33 MB 再转 24 MB BMP。常规传输不该付这个钱。
+     */
+    var diagnosticsEnabled: Bool {
+        get { box.diagEnabled }
+        set { box.diagEnabled = newValue }
+    }
 
     /// 实际判别出的档位（0 = 尚未解出任何帧）
     @Published private(set) var detectedGrid: Int32 = 0
@@ -389,14 +405,17 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         try? FileManager.default.removeItem(at: denseDiagDir())
         successStreak = 0
         box.decoder.resetLock()
+        /* 2K 没有对应预设，走 .inputPriority 由 configure 直接选设备 format */
         let preset: AVCaptureSession.Preset
         switch resolution {
         case .hd720p: preset = .hd1280x720
         case .hd1080p: preset = .hd1920x1080
+        case .qhd2K: preset = .inputPriority
         case .uhd4K: preset = .hd4K3840x2160
         }
+        let want = resolution
         sessionQueue.async { [weak self] in
-            self?.configure(preset: preset)
+            self?.configure(preset: preset, resolution: want)
             self?.session.startRunning()
         }
     }
@@ -420,7 +439,8 @@ final class DenseCameraScanner: NSObject, ObservableObject,
 
     /// 在 sessionQueue 上执行：只碰 session/videoOutput（AVCaptureSession 的
     /// begin/commitConfiguration 区间是线程安全的）与 box.device
-    private nonisolated func configure(preset: AVCaptureSession.Preset) {
+    private nonisolated func configure(preset: AVCaptureSession.Preset,
+                                       resolution: ScanResolution) {
         session.beginConfiguration()
 
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -433,10 +453,28 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         box.device = dev
 
         /* canSetSessionPreset 取决于当前输入，必须在 addInput 之后问。
-           4K 并非所有机型/镜头都支持，不能设就退回 1080p */
+           2K / 4K 并非所有机型与镜头都支持，不能设就退回 1080p */
         session.sessionPreset = session.canSetSessionPreset(preset) ? preset : .hd1920x1080
 
         if (try? dev.lockForConfiguration()) != nil {
+            /*
+             * 2K 走 .inputPriority，分辨率由 activeFormat 决定，这里自己挑一个。
+             * 判据只有两条：横向像素最接近目标，且该 format 支持到 20fps。
+             * 挑不到就什么都不做，session 会沿用它自己选的那个。
+             */
+            if resolution == .qhd2K, session.sessionPreset == .inputPriority {
+                let target = resolution.targetWidth
+                let pick = dev.formats.filter { f in
+                    let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                    guard d.width >= 1920 && d.width <= 3200 else { return false }
+                    return f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 20 }
+                }.min { a, b in
+                    let wa = Int(CMVideoFormatDescriptionGetDimensions(a.formatDescription).width)
+                    let wb = Int(CMVideoFormatDescriptionGetDimensions(b.formatDescription).width)
+                    return abs(wa - target) < abs(wb - target)
+                }
+                if let pick { dev.activeFormat = pick }
+            }
             /*
              * 对焦策略：屏摄的被摄物是 20–60 cm 处的一块屏幕，且手持时距离一直在变。
              * - 限制对焦搜索范围到近距，避免来回拉到无穷远，合焦快得多；
@@ -577,7 +615,7 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         /* 失败帧留样：CSV 只有数字，复现故障还得看像素。
            限量限频由 claimFailureShot 把关，文件名带上与 CSV 同源的 t_ms，
            便于把图和日志行对上。 */
-        if let e = err,
+        if box.diagEnabled, let e = err,
            let n = box.claimFailureShot(at: at, limit: kMaxFailureShots,
                                         minGap: kFailureShotGap),
            let copy = copyBGRA(pixelBuffer) {
@@ -602,16 +640,19 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         processedMeter.record()
         var duplicate = false
         defer {
-            /* 成功与失败都记一条：只记失败无法算失败率，只记成功看不到劣化过程 */
-            telemetry.append(TelemetryLog.Record(
-                tMs: Int((at - scanStart) * 1000),
-                result: failure?.logName ?? "ok",
-                diag: diag,
-                frameBytes: decoded?.count ?? 0,
-                duplicate: duplicate,
-                tracking: tracking,
-                exposureLocked: isLocked,
-                decodeMs: decodeMs))
+            /* 成功与失败都记一条：只记失败无法算失败率，只记成功看不到劣化过程。
+               诊断模式关闭时整条跳过。 */
+            if box.diagEnabled {
+                telemetry.append(TelemetryLog.Record(
+                    tMs: Int((at - scanStart) * 1000),
+                    result: failure?.logName ?? "ok",
+                    diag: diag,
+                    frameBytes: decoded?.count ?? 0,
+                    duplicate: duplicate,
+                    tracking: tracking,
+                    exposureLocked: isLocked,
+                    decodeMs: decodeMs))
+            }
         }
 
         guard let frame = decoded else {
@@ -667,6 +708,7 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         case .headerInvalid: return "头部校验失败，请对焦或靠近"
         case .calibrationFailed: return "定标条对比度不足，请调整亮度或反光"
         case .rsUncorrectable: return "纠错失败，画面可能过暗或抖动"
+        case .signalTooWeak: return "画面信噪比过低，多半抓在屏幕换帧的瞬间"
         case .capacityMismatch: return "载荷长度异常"
         case .badArgs, .outOfMemory, .none: return ""
         }

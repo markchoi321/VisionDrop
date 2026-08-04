@@ -15,13 +15,32 @@ enum ScanResolution: String, CaseIterable, Identifiable {
     case hd720p = "720p"
     case hd1080p = "1080p"
     /*
-     * 高档位（112/128 格）在 1080p 下每格只剩 7.8 像素，判决余量被压到临界点。
-     * 同样的取景换到 4K，每格像素翻一倍多，代价是 find_finders 的耗时按像素数
-     * 线性上升。设备不支持时会自动退回 1080p。
+     * 2K 是 1080p 与 4K 之间的补档。1080p 下 N=128 每格只剩 6.9 像素，
+     * 4K 下 13.1 像素但采集带宽是 1080p 的四倍（发热的主要来源）。
+     * 2K 约 9.8 像素，与 N=96 在 1080p 下的密度相当，带宽只有 4K 的 44%。
+     *
+     * AVCaptureSession 没有 2K 预设，只能直接选设备 format，因此走
+     * .inputPriority；选不到合适的 format 时退回 1080p。
+     */
+    case qhd2K = "2K"
+    /*
+     * 高档位（112/128 格）在 1080p 下判决余量被压到临界点。同样的取景换到
+     * 4K，每格像素翻一倍多，代价是 find_finders 的耗时按像素数线性上升。
+     * 设备不支持时会自动退回 1080p。
      */
     case uhd4K = "4K"
 
     var id: String { rawValue }
+
+    /// 目标横向像素数，用于挑设备 format（仅 2K 用得上）
+    var targetWidth: Int {
+        switch self {
+        case .hd720p: return 1280
+        case .hd1080p: return 1920
+        case .qhd2K: return 2560
+        case .uhd4K: return 3840
+        }
+    }
 }
 
 // MARK: - 旧 JSON 格式（兼容分支，只保留解析与重组）
@@ -71,6 +90,12 @@ class FileReceiver: ObservableObject {
     @Published var logs: [LogEntry] = []
     /** 摄像头分辨率，默认 720p */
     @Published var scanResolution: ScanResolution = .hd720p
+    /*
+     * 诊断模式。开启后逐帧记遥测、失败帧留样落盘，用于排查；关闭时这些
+     * 全部不做。留样那条路径在 4K 下一帧要拷 33 MB 再转 24 MB BMP，
+     * 即便挪到后台队列也是实打实的内存与 IO 开销，常规传输不该付这个钱。
+     */
+    @Published var diagnosticsEnabled: Bool = false
     /// 会话内部状态变化时递增，驱动 SwiftUI 刷新（ReceiveSession 是引用类型）
     @Published var revision: Int = 0
 

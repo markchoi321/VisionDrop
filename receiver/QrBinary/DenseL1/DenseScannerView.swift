@@ -117,6 +117,7 @@ struct DenseScannerView: View {
                         Button("导出诊断包（\(scanner.logCount) 条 / \(scanner.failureShotCount) 张）") {
                             scanner.exportTelemetry()
                         }
+                        .disabled(!receiver.diagnosticsEnabled)
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -125,6 +126,7 @@ struct DenseScannerView: View {
             .onAppear {
                 scanner.grid = grid
                 scanner.resolution = receiver.scanResolution
+                scanner.diagnosticsEnabled = receiver.diagnosticsEnabled
                 scanner.onFrameDecoded = { [weak receiver] frame in
                     guard let receiver = receiver else { return }
                     Task { @MainActor in

@@ -1095,6 +1095,12 @@ static void scan_rows(const vdd_image *img, const local_thresh *lt,
     if (y_to > img->height) y_to = img->height;
     if (x_from < 0) x_from = 0;
     if (x_to > img->width) x_to = img->width;
+    /*
+     * 行步长固定为 2，别按图像高度放大。试过 4K 用步长 4（环有 90 px 高，
+     * 采样次数看似绰绰有余），实测把两张原本 22/22 整帧解出的 12MP 实拍
+     * 打成 0/22：定位图形的中心是按命中行的质心算的，行少一半质心就粗一半，
+     * 角点一偏，后面全盘皆输。省下的那点扫描时间远不抵这个代价。
+     */
     for (int y = y_from; y < y_to; y += 2) {
         int run_len[64];
         int run_x[64];
@@ -1675,7 +1681,7 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
            即可认定是这条路径。 */
         if (diag) { diag->rs_blocks = nb; diag->rs_erasures = n_bad; }
         free(ws); free(free_idx);
-        return VDD_ERR_RS;
+        return VDD_ERR_SIGNAL;
     }
 
     /* 解交织 + 分块 errata 纠错 */

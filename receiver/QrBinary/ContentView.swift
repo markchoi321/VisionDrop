@@ -64,6 +64,22 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
             }
 
+            /*
+             * 诊断模式。默认关，因为它不是免费的：逐帧遥测要加锁写一条记录，
+             * 失败帧留样要拷一整帧再转 BMP 落盘，4K 下这两项都以十 MB 计。
+             * 只在要导出诊断包给人分析时才开。
+             */
+            Toggle(isOn: $receiver.diagnosticsEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("诊断模式").font(.caption)
+                    Text(receiver.diagnosticsEnabled
+                         ? "逐帧记录遥测并留存失败帧，可导出诊断包；吞吐会下降"
+                         : "只跑传输，不记录——常规使用选这个")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             // 采样混叠模型：每个符号的期望扫描次数 N = 间隔 x 帧率 / 1000，经验阈值 2.5
             Text(scanRateHint)
                 .font(.caption2)
@@ -77,8 +93,8 @@ struct ContentView: View {
 
     /// 密集管线按相机原生 30fps 处理，由此推出发送端可用的最短显示间隔
     private var scanRateHint: String {
-        "相机按 30fps 采集，发送端显示间隔建议不低于 84 ms（N = 间隔 × 帧率 / 1000 ≥ 2.5）；" +
-        "分辨率越高单帧处理越重，先用 720p 试，格子看不清再上 1080p"
+        "相机限帧 20fps，发送端显示间隔建议不低于 100 ms；分辨率越高单帧越重也越费电，" +
+        "96 格用 1080p、112/128 格用 2K，2K 仍解不出再上 4K"
     }
 
     // MARK: - 操作区
