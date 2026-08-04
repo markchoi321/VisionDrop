@@ -80,9 +80,14 @@
 **该 BMP 可直接喂给 C 侧 harness 复现**，无需重建现场：
 
 ```bash
-clang -O2 -std=c99 auto_test.c receiver/QrBinary/DenseL1/vd_dense_core.c -o auto_test -lm
-./auto_test <含 manifest.txt 的目录>
+clang -O2 -std=c99 -o vddh protocol/dense/harness.c receiver/QrBinary/DenseL1/vd_dense_core.c -lm
+./vddh -r 5 protocol/dense/golden/*.bmp        # 金图像回归
+./vddh -l testdata/vdd-diag/fail*.bmp          # -l 跨帧复用跟踪锁，模拟连续取景
 ```
+
+harness 每帧打印解码结果、分阶段耗时与 RS 观测量。**优化解码器时速度与准确性
+必须一起看**——本仓库已经有两次「明显更快」的改动实测把原本整帧解出的真机
+照片打成 0 块通过，见下面「试过但退回的优化」。
 
 界面底部常驻一行标定读数。**成功时**显示「档位 / 每格像素 / 弓曲 / 头部分歧」，
 **失败时**显示走得最远那个候选档位的「档位 / 每格像素 / 三通道对比度」——
