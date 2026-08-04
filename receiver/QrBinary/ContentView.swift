@@ -11,8 +11,7 @@ import Combine
 struct ContentView: View {
     @StateObject private var receiver = FileReceiver()
     @Environment(\.scenePhase) private var scenePhase
-    @State private var showCamera = false
-    @State private var showPhotoPicker = false
+    @State private var showDenseCamera = false
     @State private var showLoadPicker = false
     @State private var showClearConfirm = false
     @State private var expandedSessionId: UInt32?
@@ -20,8 +19,6 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                enginePicker
-
                 scanSettings
 
                 controlSection
@@ -38,11 +35,8 @@ struct ContentView: View {
 
                 logSection
             }
-            .sheet(isPresented: $showCamera) {
-                CameraScannerView(receiver: receiver)
-            }
-            .sheet(isPresented: $showPhotoPicker) {
-                PhotoImportView(receiver: receiver)
+            .sheet(isPresented: $showDenseCamera) {
+                DenseScannerView(receiver: receiver)
             }
             .sheet(isPresented: $showLoadPicker) {
                 DocumentPickerView(receiver: receiver)
@@ -52,34 +46,6 @@ struct ContentView: View {
                 if phase != .active { receiver.saveAllProgress(force: true) }
             }
         }
-    }
-
-    // MARK: - 引擎选择器
-
-    private var enginePicker: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 12) {
-                Text("识别引擎")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Picker("识别引擎", selection: $receiver.selectedEngine) {
-                    ForEach(QREngine.allCases) { engine in
-                        Text(engine.rawValue).tag(engine)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-
-            Text(receiver.selectedEngine == .avFoundation
-                 ? "AVFoundation 在采集管线内检测，功耗低、更适合高帧率"
-                 : "Vision 逐帧推理，识别率通常更高，但更吃电与发热")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal)
-        .padding(.top, 12)
-        .padding(.bottom, 12)
     }
 
     // MARK: - 扫描设置（仅在启动扫描前生效）
@@ -98,69 +64,36 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
             }
 
-            HStack(spacing: 12) {
-                Text("帧率")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                // 5…60fps，每档 5fps。超过 30 需显式选 activeFormat，见 CameraScanner
-                Slider(
-                    value: Binding(
-                        get: { Double(receiver.maxScanFps) },
-                        set: { receiver.maxScanFps = Int($0) }
-                    ),
-                    in: 5...60,
-                    step: 5
-                )
-
-                Text("\(receiver.maxScanFps) fps")
-                    .font(.caption.monospacedDigit())
-                    .frame(width: 56, alignment: .trailing)
-                    .foregroundStyle(.secondary)
-            }
-
-            // 采样混叠模型：每个二维码的期望扫描次数 N = 间隔 x 帧率 / 1000，经验阈值 2.5
+            // 采样混叠模型：每个符号的期望扫描次数 N = 间隔 x 帧率 / 1000，经验阈值 2.5
             Text(scanRateHint)
                 .font(.caption2)
-                .foregroundStyle(receiver.maxScanFps > 30 ? .orange : .secondary)
+                .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal)
+        .padding(.top, 12)
         .padding(.bottom, 12)
     }
 
-    /// 由帧率推出发送端可用的最短显示间隔，并在高帧率下提示发热
+    /// 密集管线按相机原生 30fps 处理，由此推出发送端可用的最短显示间隔
     private var scanRateHint: String {
-        let minInterval = Int((2.5 / Double(receiver.maxScanFps) * 1000).rounded(.up))
-        let base = "发送端显示间隔建议不低于 \(minInterval) ms（N = 间隔 × 帧率 / 1000 ≥ 2.5）"
-        if receiver.maxScanFps > 30 {
-            return base + "；超过 30fps 需相机支持高帧率格式，发热明显上升，建议配合 AVFoundation 引擎"
-        }
-        return base
+        "相机按 30fps 采集，发送端显示间隔建议不低于 84 ms（N = 间隔 × 帧率 / 1000 ≥ 2.5）；" +
+        "分辨率越高单帧处理越重，先用 720p 试，格子看不清再上 1080p"
     }
 
     // MARK: - 操作区
 
     private var controlSection: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                Button {
-                    showCamera = true
-                } label: {
-                    Label("摄像头扫描", systemImage: "camera.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-
-                Button {
-                    showPhotoPicker = true
-                } label: {
-                    Label("导入图片", systemImage: "photo.on.rectangle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
+            // 唯一的物理层：8 色格阵，档位需与发送端 dense.html 一致
+            Button {
+                showDenseCamera = true
+            } label: {
+                Label("密集 8 色扫描", systemImage: "square.grid.3x3.fill")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.borderedProminent)
+            .tint(.purple)
 
             HStack(spacing: 12) {
                 Button {
@@ -203,13 +136,13 @@ struct ContentView: View {
     private var emptyStateView: some View {
         VStack(spacing: 16) {
             Spacer()
-            Image(systemName: "qrcode.viewfinder")
+            Image(systemName: "square.grid.3x3.fill")
                 .font(.system(size: 64))
                 .foregroundStyle(.secondary)
             Text("暂无接收会话")
                 .font(.title3)
                 .foregroundStyle(.secondary)
-            Text("请启动摄像头扫描或导入二维码图片")
+            Text("请启动密集 8 色扫描，或导入此前保存的进度")
                 .font(.subheadline)
                 .foregroundStyle(.tertiary)
             Spacer()

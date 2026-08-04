@@ -7,9 +7,13 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * QR 版本容量表与档位生成（CONTRACT.md 第 1 / 9 节）。
+ * 遗留容量表与档位生成（CONTRACT.md 第 1 / 9 节）。
  *
- * 容量表是 ECC=L 字节模式的载荷上限，两端必须内置同一张表。
+ * 【定位】本表来自已迁出的二维码物理层（ECC=L 字节模式载荷上限），
+ * 当前的密集 8 色色块码路径不使用它。保留的唯一理由是：
+ * `protocol/vectors/params.txt` 与 `tiers.txt` 把选参与分档逻辑逐字段钉死，
+ * 这两个向量文件仍由 Web、Java 两个独立实现互相校验，删掉表即等于废掉向量。
+ * 修改本文件前请先确认对应向量不再被任何实现消费。
  */
 public final class QrCapacity {
 

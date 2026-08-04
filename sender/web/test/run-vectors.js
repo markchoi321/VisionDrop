@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 /*
- * Web 发送端跨语言向量测试：用 Node 加载 vd-protocol.js / vd-qr.js，
- * 逐位比对 protocol/vectors/ 下的全部测试向量，并导出帧转储供
- * protocol/crosscheck.py 做端到端还原校验（契约 14）。
+ * Web 发送端跨语言向量测试：用 Node 加载 vd-protocol.js，逐位比对
+ * protocol/vectors/ 下的 L2–L5 协议层测试向量（PRNG / 量化 CDF /
+ * LT 邻居 / RLNC 系数 / 选参 / 档位 / 流层 / 会话 ID / 帧编码），
+ * 并导出帧转储供 protocol/crosscheck.py 做端到端还原校验（契约 14）。
+ *
+ * 物理层已切换为密集 8 色码（VD-D1），其向量见 run-dense-vectors.js；
+ * 本脚本不再校验二维码矩阵层。
  *
  * 运行：node sender/web/test/run-vectors.js
  */
@@ -12,7 +16,6 @@ var fs = require("fs");
 var path = require("path");
 
 var VDP = require("../vd-protocol.js");
-var VDQR = require("../vd-qr.js");
 
 var VEC = path.join(__dirname, "..", "..", "..", "protocol", "vectors");
 var failures = 0, checks = 0;
@@ -92,6 +95,7 @@ lines("params.txt").forEach(function (l) {
 console.log("params.txt 通过");
 
 /* ---------------------------------------------------------- 6. 档位 */
+/* 档位表仍取自 QR_CAPACITY，物理层虽已切换，该表被跨实现向量钉死，保留校验 */
 var tierRows = {};
 lines("tiers.txt").forEach(function (l) {
     var p = l.split(" ").map(Number);
@@ -157,32 +161,7 @@ var picked = VDP.pickParams(st.stream.length);
 ok(picked.codec === VDP.CODEC_RLNC && picked.T === +e2e["rlnc.T"] &&
     picked.K === +e2e["rlnc.K"], "fixture 选参与 e2e 一致");
 
-/* ---------------------------------------------------------- 8. QR 数据码字 */
-lines("qr_codewords.txt").forEach(function (l) {
-    var p = l.split(" ");
-    var version = +p[0];
-    var frameBytes = new Uint8Array(p[1].length / 2);
-    for (var i = 0; i < frameBytes.length; i++) {
-        frameBytes[i] = parseInt(p[1].substr(i * 2, 2), 16);
-    }
-    var got = hex(VDQR.buildDataCodewords(version, frameBytes));
-    ok(got === p[2], "qr_codewords V" + version + "\n期望 " + p[2] + "\n实得 " + got);
-});
-console.log("qr_codewords.txt 通过");
-
-/* ---------------------------------------------------------- 9. QR 结构自检 */
-/* 每个版本编码一次，校验矩阵尺寸与总码字数 */
-for (var v = 1; v <= 40; v++) {
-    var cap = VDQR.capacity(v);
-    ok(cap === VDP.QR_CAPACITY[v], "V" + v + " 容量表一致");
-    var data = new Uint8Array(cap);
-    for (var i = 0; i < cap; i++) { data[i] = (i * 7 + v) & 0xFF; }
-    var qr = VDQR.encode(v, data, v % 8);
-    ok(qr.n === 17 + 4 * v, "V" + v + " 模块数");
-}
-console.log("QR 全版本结构自检通过");
-
-/* ---------------------------------------------------------- 10. 帧转储 */
+/* ---------------------------------------------------------- 8. 帧转储 */
 /* 契约 14：导出 [4B 大端长度][帧字节] 记录流，交给 crosscheck.py 端到端还原 */
 var dumpPath = process.argv[2] || path.join(require("os").tmpdir(), "vd_web_dump.bin");
 var parts = [];

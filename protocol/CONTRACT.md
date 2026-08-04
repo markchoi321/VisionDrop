@@ -1,8 +1,11 @@
 # VisionDrop 协议 v1 实现契约
 
-本文件把 `docs/refactor-design.md` 中未完全确定的算法细节固定下来，是发送端（Java）与
-接收端（Swift）唯一的权威语义来源。凡设计文档与本文件冲突，以本文件为准，冲突点在
-第 10 节列出。
+本文件把 `docs/refactor-design.md` 中未完全确定的算法细节固定下来，是发送端与接收端
+唯一的权威语义来源。凡设计文档与本文件冲突，以本文件为准，冲突点在第 10 节列出。
+
+**范围限于 L2–L5**（帧层、喷泉码、流层、会话）。物理层 L1 是密集 8 色色块码（VD-D1），
+规约另见 `protocol/dense/DENSE.md`；二维码物理层已迁出本仓库，本文件不再描述它。
+文中残留的 QR 版本/容量概念只作为**遗留容量表**存在，见第 1、5、9 节的说明。
 
 参考实现：`protocol/refimpl.py`。测试向量：`protocol/vectors/`。
 **两端实现必须逐位复现向量，这是唯一的验收标准。**
@@ -26,10 +29,13 @@
 | 最低档容量 | 512 字节 | 设计 10.4 |
 | 最大档位数 | 10 | 设计 10.4 |
 | LT 度分布参数 | `c = 0.03`, `δ = 0.05` | 见 10.2 |
-| ECC 级别 | L，margin 2，**不设 CHARACTER_SET hint** | 设计 3.1 |
 
-QR 版本 → ECC=L 字节模式容量表见 `refimpl.py` 的 `QR_CAPACITY`，两端必须内置同一张表。
-模块数 = `17 + 4 × 版本`。
+### 遗留容量表
+
+`refimpl.py` 的 `QR_CAPACITY`（版本 1–40，模块数 = `17 + 4 × 版本`，上限 2953 字节）是
+**遗留容量表，仅用于跨实现向量校验，色块码路径不使用**。它是第 5 节选参与第 9 节档位
+生成的输入，而这两处逻辑被 `vectors/params.txt` 与 `vectors/tiers.txt` 逐字段钉死，
+因此实现该表仍是通过向量的前提。VD-D1 有自己的容量模型，见 `protocol/dense/DENSE.md`。
 
 `m` 是 uint8，`T ≥ 16` 保证 `m = (2953−20)/T ≤ 183`，不会溢出。
 
@@ -175,7 +181,7 @@ neighborsOf(blockId, K):
 候选 = []
 for T in 16…500:
     K = ceil(streamLen / T)                 // 至少 1
-    m = (2953 − 20) / T                     // 整除，按 V40 估算
+    m = (2953 − 20) / T                     // 整除，按遗留容量表上限估算
     if m < 1: continue
     if K ≤ 2720 且 K ≤ 8×T:
         frames = ceil( ceil(K × (1 + 2.0/K)) / m )
@@ -195,7 +201,9 @@ T=419 都是 175 帧，选 293）。
 **不实现独立的"直传模式"。** 设计 8.6 自己指出直传是解方程的自然退化，独立实现只会多一条
 代码路径。小文件走同一套选参即可（5 KB → T=26, K≈200, ε=1%）。
 
-输出对照：`vectors/params.txt`，与设计 8.4 分档表逐行一致。
+输出对照：`vectors/params.txt`，与设计 8.4 分档表逐行一致。式中的 2953 / 20 取自第 1 节的
+遗留容量表：**该选参算法是跨实现向量校验的对象，色块码路径按每档自己的净载荷另行选 T**
+（见 `protocol/dense/DENSE.md`）。
 
 ---
 
@@ -273,6 +281,9 @@ sessionId = SHA256( sha256(文件内容) ‖ T(2B 大端) ‖ K(3B 大端) ‖ c
 ---
 
 ## 9. 档位生成（设计 10.4）
+
+**遗留算法，仅用于跨实现向量校验**：输入是第 1 节的遗留容量表，输出被 `vectors/tiers.txt`
+钉死。色块码的档位是物理层参数 N=64–128，不走这套规则，见 `protocol/dense/DENSE.md`。
 
 ```
 need = max(512, 20 + T)
@@ -365,60 +376,13 @@ pivot 索引，`neighbors` 写系数向量中置 1 的源块索引（升序）�
 
 ---
 
-## 11.5 接收端取字节：payloadData 不是帧字节
-
-**这是一个已经在现场造成「完全识别不了」的坑，实现时必须处理。**
-
-`VNBarcodeObservation.payloadData`（以及 `CIQRCodeDescriptor.errorCorrectedPayload`）返回的
-不是写进二维码的那串字节，而是**纠错后的原始数据码字流**，结构由 QR 标准规定：
-
-```
-4 bit 模式指示符（字节模式 = 0100）
-8 或 16 bit 字符计数（V1–V9 为 8 bit，V10–V40 为 16 bit）
-n 字节数据
-终止符 + 填充（ZXing 填 0xEC / 0x11 交替）
-```
-
-也就是说数据整体错位 20 bit（V10 以上），且尾部带填充。实测长度恒等于该版本的数据码字数：
-
-| 版本 | 数据码字数 | 字节模式最大容量 | 差 |
-|---|---|---|---|
-| V4 | 80 | 78 | 2（8 bit 计数） |
-| V23 | 1094 | 1091 | 3 |
-| V40 | 2956 | 2953 | 3 |
-
-直接把 `payloadData` 当帧字节用，首字节会是 `0x40` 而不是帧魔数 `0x56`，**每一帧都会被丢弃**。
-
-正确做法：按位取出字节模式段。版本从 `CIQRCodeDescriptor.symbolVersion` 拿；拿不到时按
-16 bit 计数假定即可，本协议最低档为 V15。旧 JSON 格式的发送端设了 `CHARACTER_SET` hint，
-会先插入 ECI 段（模式 `0111`），这条路径应退回 `payloadStringValue`。
-
-测试向量 `vectors/qr_codewords.txt`，格式 `<symbolVersion> <期望帧 hex> <原始码字 hex>`，
-覆盖 V4 / V11 / V23 / V40（含 8 bit 与 16 bit 两种计数分支）。
-
-**注意 iOS 模拟器跑不了 Vision 的条码检测**（抛 `com.apple.Vision Code=9
-"Could not create inference context"`），所以这条路径的回归测试必须是向量驱动的，
-活体 Vision 往返只能在真机或 macOS 上验证。这也正是该缺陷此前无人发现的原因。
-
----
-
 ## 12. 兼容性（设计 12.1）
 
 接收端按载荷首字节分流：`0x56` 走新二进制协议，`0x7B`（`{`）走旧 JSON 分支。
 旧分支只保留解析与重组能力，不再新增功能。
 
-**两种引擎都能取二进制载荷。** 设计文档 1.2 把「AVFoundation / CIDetector 无法取得二进制」
-列为硬约束，实测不成立：`stringValue` / `messageString` 在二进制载荷下确实为 nil，但
-
-- `AVMetadataMachineReadableCodeObject.descriptor`（iOS 11 起）
-- `CIQRCodeFeature.symbolDescriptor`（iOS 11 起）
-- `VNBarcodeObservation.barcodeDescriptor`
-
-都返回 `CIQRCodeDescriptor`，其 `errorCorrectedPayload` 就是 11.5 说的原始数据码字，
-按同一套逻辑取出字节模式段即可。实测 V15–V40 十档全部逐字节还原。
-
-工程含义：AVFoundation 的元数据输出在采集管线内完成检测，功耗远低于逐帧跑 Vision 推理，
-因此它是高帧率扫描更合适的引擎，不应被移除。
+L1 交给上层的一律是**完整帧字节**（首字节即帧魔数 `0x56`）。物理层如何从符号里取出这串
+字节属于 L1 的内部事务，本契约不作规定；VD-D1 的取字节路径见 `protocol/dense/DENSE.md`。
 
 ---
 
@@ -430,13 +394,12 @@ n 字节数据
 | `rs_cdf.txt` | 量化 CDF 抽样点 | `<K> <d> <cdf_q 十进制>` |
 | `lt_neighbors.txt` | LT 邻居集合 | `<K> <blockId> <degree> <idx,idx,…>` |
 | `rlnc_coeff.txt` | RLNC 系数向量 | `<K> <blockId> <hex 小端>` |
-| `params.txt` | 选参输出 | `<streamLen> <codec> <T> <K> <m@V40> <frames>` |
-| `tiers.txt` | 档位表 | `<T> <档位序号> <版本> <容量> <m>` |
+| `params.txt` | 选参输出（遗留容量表，见第 1 / 5 节） | `<streamLen> <codec> <T> <K> <m@上限> <frames>` |
+| `tiers.txt` | 档位表（遗留容量表，见第 1 / 9 节） | `<T> <档位序号> <版本> <容量> <m>` |
 | `deflate_plain.bin` / `deflate_packed.bin` | raw deflate 往返 | 二进制 |
 | `fixture.bin` | 20000 字节原始文件 | 二进制 |
 | `stream.bin` | 上者的流层字节（未压缩） | 二进制 |
 | `frames_rlnc.txt` / `frames_lt.txt` | 整帧字节 | `<baseBlockId> <整帧hex>` |
-| `qr_codewords.txt` | QR 原始数据码字（见 11.5） | `<symbolVersion> <帧hex> <码字hex>` |
 | `e2e.txt` | fixture 的 T/K/m/sessionId/sha256 | `<键> <值>` |
 
 `#` 开头的行是注释，需跳过。

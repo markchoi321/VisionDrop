@@ -15,19 +15,7 @@
     </properties>
 
     <dependencies>
-        <!-- ZXing 二维码生成库 -->
-        <dependency>
-            <groupId>com.google.zxing</groupId>
-            <artifactId>core</artifactId>
-            <version>3.5.1</version>
-        </dependency>
-        <dependency>
-            <groupId>com.google.zxing</groupId>
-            <artifactId>javase</artifactId>
-            <version>3.5.1</version>
-        </dependency>
-
-        <!-- 协议测试向量比对（Jackson / commons-codec 随 JSON 分片方案一并移除） -->
+        <!-- 本模块只保留 L2–L5 协议实现与向量比对，不含任何物理层依赖 -->
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>

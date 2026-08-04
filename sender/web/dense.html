@@ -3,9 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VisionDrop Web 发送端</title>
+<title>VisionDrop 密集 8 色发送端</title>
 <style>
-/* 只用老浏览器都支持的基础 CSS，不用 flex/grid 变量等新特性 */
 body { font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
        margin: 0; padding: 12px; background: #f4f4f4; color: #222; }
 h1 { font-size: 18px; margin: 0 0 10px 0; }
@@ -17,15 +16,15 @@ select, input, button { font-size: 14px; padding: 3px 6px; }
 button { cursor: pointer; margin-right: 6px; }
 #qrwrap { text-align: center; background: #fff; border: 1px solid #ddd;
           padding: 8px 0; }
-#qrcanvas { background: #fff; }
 #info td { padding: 2px 10px 2px 0; font-size: 13px; }
 #stats { font-size: 13px; color: #444; }
 #err { color: #b00020; }
 .hint { color: #888; font-size: 12px; }
+.warn { color: #a05a00; font-size: 12px; }
 </style>
 </head>
 <body>
-<h1>VisionDrop Web 发送端（协议 v1）</h1>
+<h1>VisionDrop 密集 8 色发送端（VD-D1）</h1>
 
 <div class="panel">
     <div class="row">
@@ -33,8 +32,8 @@ button { cursor: pointer; margin-right: 6px; }
         <span id="err"></span>
     </div>
     <div class="row hint">
-        选择文件后自动完成选参并生成会话。Web 端不做压缩（流层 flag 恒为不压缩），
-        其余语义与桌面发送端一致，接收端无需区分。
+        物理层 VD-D1：8 色格阵（每格 3 bit，RGB 立方体调色板），
+        载荷为标准 L2 帧。规约见 protocol/dense/DENSE.md。
     </div>
 </div>
 
@@ -52,7 +51,6 @@ button { cursor: pointer; margin-right: 6px; }
         <select id="tier"></select>
         <label for="interval">间隔(ms)</label>
         <input type="number" id="interval" value="150" min="30" step="10" style="width:70px">
-        <label><input type="checkbox" id="fastmask">固定掩码(低端设备提速)</label>
     </div>
     <div class="row">
         <button id="btn_play">开始播放</button>
@@ -63,37 +61,37 @@ button { cursor: pointer; margin-right: 6px; }
 </div>
 
 <div id="qrwrap" style="display:none">
-    <canvas id="qrcanvas" width="300" height="300"></canvas>
+    <canvas id="symcanvas" width="300" height="300"></canvas>
 </div>
 
 <script src="vd-protocol.js"></script>
-<script src="vd-qr.js"></script>
+<script src="vd-dense.js"></script>
 <script>
 (function () {
     "use strict";
 
-    /* 能力检测：老到没有 File API / 类型化数组的浏览器直接提示 */
     var errEl = document.getElementById("err");
     if (typeof Uint8Array === "undefined" || typeof FileReader === "undefined") {
         errEl.innerHTML = "此浏览器过旧：缺少 File API 或类型化数组（需要 IE10+ / Android 4+ / Safari 5.1+）";
         return;
     }
 
-    var sess = null;          /* VDP.SendSession */
-    var tiers = [];
+    var sess = null;
+    var content = null;       /* 原始文件内容，换档要用它重建会话 */
+    var fileName = "";
+    var tiers = [];           /* [{N, net, m, T, frames}] */
     var tierIdx = 0;
-    var nextBlockId = 0;      /* 游标：仅在帧真正显示后推进（对齐 PlaybackState 语义） */
+    var nextBlockId = 0;      /* 游标：仅在帧真正显示后推进 */
     var framesShown = 0;
     var playing = false;
     var timer = null;
-    var canvas = document.getElementById("qrcanvas");
+    var canvas = document.getElementById("symcanvas");
     var ctx = canvas.getContext("2d");
 
     var $ = function (id) { return document.getElementById(id); };
 
-    /* ------------------------------------------------ 播放状态持久化 */
-
-    function stateKey() { return "vdweb." + VDP.sessionIdHex(sess.sid); }
+    /* 密集模式的持久化键 */
+    function stateKey() { return "vdweb.dense." + VDP.sessionIdHex(sess.sid); }
 
     function loadState() {
         try {
@@ -102,9 +100,8 @@ button { cursor: pointer; margin-right: 6px; }
             var st = JSON.parse(raw);
             nextBlockId = st.nextBlockId % 4294967296 || 0;
             framesShown = st.framesShown || 0;
-            if (st.tier >= 0 && st.tier < tiers.length) { tierIdx = st.tier; }
             if (st.intervalMs >= 30) { $("interval").value = st.intervalMs; }
-        } catch (e) { /* localStorage 不可用（如 file:// 下的老 IE）时静默跳过 */ }
+        } catch (e) { /* localStorage 不可用时静默跳过 */ }
     }
 
     function saveState() {
@@ -112,18 +109,40 @@ button { cursor: pointer; margin-right: 6px; }
             window.localStorage.setItem(stateKey(), JSON.stringify({
                 nextBlockId: nextBlockId,
                 framesShown: framesShown,
-                tier: tierIdx,
                 intervalMs: parseInt($("interval").value, 10) || 150
             }));
         } catch (e) { /* 同上 */ }
     }
 
-    /* ------------------------------------------------ 界面 */
-
     function fmtSize(n) {
         if (n < 1024) { return n + " B"; }
         if (n < 1048576) { return (n / 1024).toFixed(1) + " KB"; }
         return (n / 1048576).toFixed(2) + " MB";
+    }
+
+    /*
+     * 密集档位。**每档各自选自己的 T**，而不是全档共用一个。
+     *
+     * 帧长必须是 20 + m*T，所以单档的浪费是 (净容量 - 20) mod T。一个 T 不可能
+     * 让五档都装满：实测某 1.2 MB 文件用单一 T=488（还是按默认容量表挑的）时，
+     * 各档填充率只有 80%–96%，N=80 档白扔 20%；改成每档各自选 T 后五档全部 100%，
+     * 一轮所需帧数 N=80 降 20%、N=96 降 11%、N=112 降 10%。
+     * 代价是 T 变了 sessionId 就变，因此换档等于换会话，游标要重来——
+     * 这在换档本就是「重新开始一轮」的语义下是可接受的。
+     */
+    function buildTiers(streamLen) {
+        var out = [];
+        for (var i = 0; i < VDD.GRID_SIZES.length; i++) {
+            var N = VDD.GRID_SIZES[i];
+            var net = VDD.capacity(N).net;
+            var p = VDP.pickParams(streamLen, net);
+            var m = Math.min(255, Math.floor((net - 20) / p.T));
+            if (m < 1) { continue; }
+            var eps = p.codec === VDP.CODEC_RLNC ? VDP.epsRlnc(p.K) : VDP.epsLt(p.K);
+            out.push({ N: N, net: net, m: m, T: p.T,
+                       frames: Math.ceil(Math.ceil(p.K * (1 + eps)) / m) });
+        }
+        return out;
     }
 
     function currentPassFrames() {
@@ -132,11 +151,39 @@ button { cursor: pointer; margin-right: 6px; }
         return Math.ceil(Math.ceil(sess.K * (1 + eps)) / m);
     }
 
+    /* 切到第 idx 档：按该档容量重建会话（T 随之改变），游标归零 */
+    function applyTier(idx) {
+        tierIdx = idx;
+        try {
+            sess = new VDP.SendSession(content, fileName, tiers[idx].net);
+        } catch (e) {
+            errEl.innerHTML = "会话创建失败: " + e.message;
+            return false;
+        }
+        tiers[idx].m = Math.min(255, Math.floor((tiers[idx].net - 20) / sess.T));
+        nextBlockId = 0;
+        framesShown = 0;
+        loadState();
+        showSession();
+        return true;
+    }
+
+    function showSession() {
+        $("i_file").innerHTML = sess.fileName;
+        $("i_size").innerHTML = fmtSize(sess.contentLen) +
+            "（流层 " + fmtSize(sess.stream.length) + "）";
+        $("i_codec").innerHTML = sess.codec === VDP.CODEC_RLNC ? "解方程(RLNC)" : "剥洋葱(LT)";
+        $("i_sid").innerHTML = VDP.sessionIdHex(sess.sid);
+        $("i_T").innerHTML = sess.T;
+        $("i_K").innerHTML = sess.K;
+        $("sesspanel").style.display = "";
+        refreshStats();
+    }
+
     function refreshStats() {
-        var pass = currentPassFrames();
         $("stats").innerHTML = "已播帧数 " + framesShown +
             " ｜ 下一块序号 " + nextBlockId +
-            " ｜ 当前档一轮约需 " + pass + " 帧" +
+            " ｜ 当前档一轮约需 " + currentPassFrames() + " 帧" +
             " ｜ 间隔 " + (parseInt($("interval").value, 10) || 150) + " ms";
     }
 
@@ -147,23 +194,21 @@ button { cursor: pointer; margin-right: 6px; }
             var t = tiers[i];
             var opt = document.createElement("option");
             opt.value = i;
-            opt.text = "档" + (i + 1) + "  V" + t.version + "  每帧 " + t.m + " 块";
+            var fill = Math.round(100 * (20 + t.m * t.T) / t.net);
+            opt.text = "档" + (i + 1) + "  " + t.N + "格  每帧 " + t.m +
+                " 块  一轮 " + t.frames + " 帧  填充 " + fill + "%";
             sel.appendChild(opt);
         }
         sel.selectedIndex = tierIdx;
     }
 
-    /* ------------------------------------------------ 渲染 */
-
-    var MARGIN = 2;    /* 契约：margin 2 */
+    var MARGIN = VDD.QUIET;   /* 静区 2 格 */
 
     function drawFrame() {
         var t = tiers[tierIdx];
         var frame = sess.encodeFrame(nextBlockId, t.m);
-        var fixedMask = $("fastmask").checked ? (framesShown & 7) : undefined;
-        var qr = VDQR.encode(t.version, frame, fixedMask);
-        var n = qr.n;
-        /* 取窗口可用宽高的较小者，模块用整数像素避免糊边 */
+        var sym = VDD.encode(frame, t.N);
+        var n = sym.n;
         var avail = Math.min(
             (window.innerWidth || document.documentElement.clientWidth) - 40,
             (window.innerHeight || document.documentElement.clientHeight) - 60);
@@ -175,15 +220,15 @@ button { cursor: pointer; margin-right: 6px; }
         canvas.height = size;
         ctx.fillStyle = "#fff";
         ctx.fillRect(0, 0, size, size);
-        ctx.fillStyle = "#000";
         for (var r = 0; r < n; r++) {
             for (var c = 0; c < n; c++) {
-                if (qr.mat[r * n + c]) {
+                var v = sym.cells[r * n + c];
+                if (v !== 7) {
+                    ctx.fillStyle = VDD.PALETTE_CSS[v];
                     ctx.fillRect((c + MARGIN) * px, (r + MARGIN) * px, px, px);
                 }
             }
         }
-        /* 帧显示成功后才推进游标（对齐 PlaybackState 语义） */
         nextBlockId = (nextBlockId + t.m) % 4294967296;
         framesShown++;
     }
@@ -201,8 +246,7 @@ button { cursor: pointer; margin-right: 6px; }
         refreshStats();
         if (framesShown % 20 === 0) { saveState(); }
         var interval = parseInt($("interval").value, 10) || 150;
-        var cost = new Date().getTime() - t0;
-        var wait = interval - cost;
+        var wait = interval - (new Date().getTime() - t0);
         if (wait < 0) { wait = 0; }
         timer = window.setTimeout(tick, wait);
     }
@@ -222,8 +266,7 @@ button { cursor: pointer; margin-right: 6px; }
         saveState();
     }
 
-    /* ------------------------------------------------ 帧转储导出（契约 14） */
-
+    /* 帧转储导出（契约 14 格式） */
     function exportDump() {
         if (!sess) { return; }
         var t = tiers[tierIdx];
@@ -246,10 +289,10 @@ button { cursor: pointer; margin-right: 6px; }
         var all = new Uint8Array(total);
         var off = 0;
         for (var i = 0; i < parts.length; i++) { all.set(parts[i], off); off += parts[i].length; }
-        var name = VDP.sessionIdHex(sess.sid) + ".vddump";
+        var name = VDP.sessionIdHex(sess.sid) + "-dense.vddump";
         try {
             var blob = new Blob([all], { type: "application/octet-stream" });
-            if (window.navigator.msSaveBlob) {          /* IE10/11 */
+            if (window.navigator.msSaveBlob) {
                 window.navigator.msSaveBlob(blob, name);
                 return;
             }
@@ -264,8 +307,6 @@ button { cursor: pointer; margin-right: 6px; }
         }
     }
 
-    /* ------------------------------------------------ 事件 */
-
     $("filepick").addEventListener("change", function () {
         var f = this.files && this.files[0];
         if (!f) { return; }
@@ -273,28 +314,30 @@ button { cursor: pointer; margin-right: 6px; }
         errEl.innerHTML = "";
         var reader = new FileReader();
         reader.onload = function () {
+            content = new Uint8Array(reader.result);
+            fileName = f.name;
+            /* 先建一次拿到流层长度（档位表要按它算每档的 T），再按选定档位重建 */
             try {
-                var content = new Uint8Array(reader.result);
-                sess = new VDP.SendSession(content, f.name);
+                sess = new VDP.SendSession(content, fileName,
+                                           VDD.capacity(VDD.GRID_SIZES[0]).net);
             } catch (e) {
                 errEl.innerHTML = "会话创建失败: " + e.message;
                 return;
             }
-            tiers = sess.tiers;
-            tierIdx = Math.floor((tiers.length - 1) / 2);
-            nextBlockId = 0;
-            framesShown = 0;
-            loadState();          /* 同一文件同参数重传时续接游标 */
+            tiers = buildTiers(sess.stream.length);
+            if (tiers.length === 0) {
+                errEl.innerHTML = "文件过大，无可用密集档位";
+                $("sesspanel").style.display = "none";
+                return;
+            }
             fillTierSelect();
-            $("i_file").innerHTML = sess.fileName;
-            $("i_size").innerHTML = fmtSize(sess.contentLen) +
-                "（流层 " + fmtSize(sess.stream.length) + "）";
-            $("i_codec").innerHTML = sess.codec === VDP.CODEC_RLNC ? "解方程(RLNC)" : "剥洋葱(LT)";
-            $("i_sid").innerHTML = VDP.sessionIdHex(sess.sid);
-            $("i_T").innerHTML = sess.T;
-            $("i_K").innerHTML = sess.K;
-            $("sesspanel").style.display = "";
-            refreshStats();
+            var last = parseInt(window.localStorage
+                ? window.localStorage.getItem("vdweb.dense.lastTier") : "", 10);
+            if (!(last >= 0 && last < tiers.length)) {
+                last = Math.floor((tiers.length - 1) / 2);
+            }
+            if (!applyTier(last)) { return; }
+            $("tier").selectedIndex = tierIdx;
         };
         reader.onerror = function () { errEl.innerHTML = "文件读取失败"; };
         reader.readAsArrayBuffer(f);
@@ -314,10 +357,13 @@ button { cursor: pointer; margin-right: 6px; }
     $("btn_dump").addEventListener("click", exportDump);
 
     $("tier").addEventListener("change", function () {
-        /* 换档只改 m：T/K/codec/sessionId 不变，游标继续推进（契约 9） */
-        tierIdx = this.selectedIndex;
-        saveState();
-        refreshStats();
+        /* 换档 = 换 T = 换 sessionId，会话必须重建、游标归零。
+           接收端会把它当成一个新会话，这与「换档就是重开一轮」的语义一致。 */
+        stop();
+        try {
+            window.localStorage.setItem("vdweb.dense.lastTier", String(this.selectedIndex));
+        } catch (e) { /* localStorage 不可用时静默跳过 */ }
+        applyTier(this.selectedIndex);
     });
 
     $("interval").addEventListener("change", function () {

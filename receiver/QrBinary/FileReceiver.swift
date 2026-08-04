@@ -8,24 +8,6 @@
 import Foundation
 import Combine
 import SwiftUI
-import CoreImage
-import Vision
-import UIKit
-
-// MARK: - 识别引擎
-
-enum QREngine: String, CaseIterable, Identifiable {
-    case avFoundation = "AVFoundation"
-    case vision = "Vision"
-
-    var id: String { rawValue }
-
-    /// 两种引擎都能取二进制：Vision 走 payloadData / barcodeDescriptor，
-    /// AVFoundation 走 AVMetadataMachineReadableCodeObject.descriptor，
-    /// 都是 CIQRCodeDescriptor 的原始数据码字（见 QRByteSegment）。
-    /// 设计文档 1.2 把「AVFoundation 拿不到二进制」列为硬约束，实测不成立。
-    var supportsBinaryPayload: Bool { true }
-}
 
 // MARK: - 扫描分辨率
 
@@ -81,9 +63,6 @@ class FileReceiver: ObservableObject {
     /// 旧 JSON 格式的文件
     @Published var legacyFiles: [String: LegacyFile] = [:]
     @Published var logs: [LogEntry] = []
-    @Published var selectedEngine: QREngine = .vision
-    /** 扫描最大帧率，5/10/15/20/25/30 六档，默认 20fps */
-    @Published var maxScanFps: Int = 20
     /** 摄像头分辨率，默认 720p */
     @Published var scanResolution: ScanResolution = .hd720p
     /// 会话内部状态变化时递增，驱动 SwiftUI 刷新（ReceiveSession 是引用类型）
@@ -94,6 +73,8 @@ class FileReceiver: ObservableObject {
 
     /// 自动保存间隔，设计 9.3
     private let autoSaveInterval: TimeInterval = 5
+    /// 进度文件写盘队列。串行，保证同一会话的先后两次写入不会乱序
+    private let ioQueue = DispatchQueue(label: "vd.progress.io", qos: .utility)
     private var backgroundObserver: NSObjectProtocol?
 
     init() {
@@ -337,107 +318,31 @@ class FileReceiver: ObservableObject {
         return true
     }
 
-    // MARK: - 从图片识别（照片导入）
-
-    func processImage(_ cgImage: CGImage) -> Bool {
-        switch selectedEngine {
-        case .avFoundation:
-            return processImageWithCIDetector(cgImage)
-        case .vision:
-            return processImageWithVision(cgImage)
-        }
-    }
-
-    private func processImageWithCIDetector(_ cgImage: CGImage) -> Bool {
-        let ciImage = CIImage(cgImage: cgImage)
-        let detector = CIDetector(ofType: CIDetectorTypeQRCode,
-                                  context: nil,
-                                  options: [CIDetectorAccuracy: CIDetectorAccuracyHigh])
-        guard let features = detector?.features(in: ciImage) as? [CIQRCodeFeature] else { return false }
-
-        var processed = false
-        for feature in features {
-            // CIQRCodeFeature.symbolDescriptor（iOS 11 起）同样给出原始数据码字，
-            // messageString 在二进制载荷下为 nil 并不代表取不到字节
-            if let data = FileReceiver.rawPayload(descriptor: feature.symbolDescriptor,
-                                                  fallbackString: feature.messageString),
-               processPayload(data) {
-                processed = true
-            }
-        }
-        return processed
-    }
-
-    private func processImageWithVision(_ cgImage: CGImage) -> Bool {
-        var processed = false
-        let request = VNDetectBarcodesRequest()
-        request.symbologies = [.qr]
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        do {
-            try handler.perform([request])
-            for result in request.results ?? [] where result.symbology == .qr {
-                if let data = FileReceiver.rawPayload(of: result), processPayload(data) {
-                    processed = true
-                }
-            }
-        } catch {
-            addLog("Vision 识别失败: \(error.localizedDescription)", isError: true)
-        }
-        return processed
-    }
-
-    /// 取原始二进制载荷。
-    ///
-    /// 注意 payloadData 给的是 QR 的原始数据码字（4bit 模式 + 8/16bit 长度 + 数据 + 填充），
-    /// 不是写进二维码的那串字节，必须按位取出字节模式段，详见 QRByteSegment。
-    /// 优先用 CIQRCodeDescriptor 拿到确切的符号版本；拿不到时按 V10+ 的 16 bit 计数假定，
-    /// 本协议最低档为 V15，该假定成立。
-    nonisolated static func rawPayload(of observation: VNBarcodeObservation) -> Data? {
-        var codewords: [UInt8]?
-        let descriptor = observation.barcodeDescriptor as? CIQRCodeDescriptor
-        if let descriptor {
-            codewords = [UInt8](descriptor.errorCorrectedPayload)
-        } else if #available(iOS 17.0, *), let data = observation.payloadData {
-            codewords = [UInt8](data)
-        }
-        return rawPayload(codewords: codewords,
-                          symbolVersion: descriptor.map { Int($0.symbolVersion) },
-                          fallbackString: observation.payloadStringValue)
-    }
-
-    /// AVFoundation 元数据输出与 CIDetector 共用：两者都能给出 CIQRCodeDescriptor
-    nonisolated static func rawPayload(descriptor: CIQRCodeDescriptor?,
-                                       fallbackString: String?) -> Data? {
-        rawPayload(codewords: descriptor.map { [UInt8]($0.errorCorrectedPayload) },
-                   symbolVersion: descriptor.map { Int($0.symbolVersion) },
-                   fallbackString: fallbackString)
-    }
-
-    /// 三条识别路径的共同出口：原始码字 -> 字节模式段；取不到时退回字符串载荷
-    private nonisolated static func rawPayload(codewords: [UInt8]?,
-                                               symbolVersion: Int?,
-                                               fallbackString: String?) -> Data? {
-        if let codewords,
-           let bytes = QRByteSegment.extract(codewords: codewords,
-                                             symbolVersion: symbolVersion ?? 40) {
-            return Data(bytes)
-        }
-        // 旧 JSON 格式带 ECI 段（模式 0111），取字节模式段会失败，走字符串载荷
-        return fallbackString?.data(using: .utf8)
-    }
-
     // MARK: - 进度持久化
 
+    /*
+     * 落盘。快照与编码必须在主 actor（解码器状态不是 Sendable），
+     * 但真正的文件写入挪到串行队列——扫描时这条路径每 5 秒走一次，
+     * 阻塞主 actor 会直接掉帧。串行保证同一会话的多次写入不会互相覆盖。
+     */
     private func persist(_ session: ReceiveSession) {
         let started = Date()
-        do {
-            try ProgressStore.save(session)
-            let ms = Diagnostics.elapsedMs(since: started)
-            if ms > 200 {
-                addLog("进度写盘偏慢：\(SessionId.hex(session.sessionId)) 耗时 \(ms) ms")
+        let data = ProgressStore.encode([session])
+        let url = ProgressStore.fileURL(for: session.sessionId)
+        session.lastSavedAt = Date()
+        let encodeMs = Diagnostics.elapsedMs(since: started)
+        let sid = SessionId.hex(session.sessionId)
+        if encodeMs > 200 {
+            addLog("进度编码偏慢：\(sid) 耗时 \(encodeMs) ms，\(data.count / 1024) KB")
+        }
+        ioQueue.async { [weak self] in
+            do {
+                try ProgressStore.ensureDirectory()
+                try data.write(to: url, options: .atomic)
+            } catch {
+                let msg = error.localizedDescription
+                Task { @MainActor in self?.addLog("进度保存失败：\(msg)", isError: true) }
             }
-        } catch {
-            addLog("进度保存失败：\(error.localizedDescription)", isError: true)
         }
     }
 

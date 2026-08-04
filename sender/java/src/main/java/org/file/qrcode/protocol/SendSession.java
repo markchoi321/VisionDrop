@@ -5,7 +5,7 @@ import java.util.List;
 /**
  * 发送会话：一次传输的全部不可变状态（设计 7.4）。
  *
- * 播放过程中可变的部分（块序号游标、档位、间隔）不在这里，见 PlaybackState。
+ * 播放过程中可变的部分（块序号游标、档位、间隔）属于物理层与界面，不在本模块内。
  */
 public final class SendSession {
 

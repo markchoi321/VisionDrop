@@ -250,7 +250,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# 校验 QrBinaryTests/vectors 与 protocol/vectors 一致，防止两份副本漂移\nset -e\nSRC=\"${SRCROOT}/../protocol/vectors\"\nDST=\"${SRCROOT}/QrBinaryTests/vectors\"\nif [ -d \"$SRC\" ]; then\n  if ! diff -r \"$SRC\" \"$DST\" > /dev/null 2>&1; then\n    echo \"error: QrBinaryTests/vectors 与 protocol/vectors 不一致，请执行 cp protocol/vectors/* receiver/QrBinaryTests/vectors/\"\n    exit 1\n  fi\nfi\n";
+			shellScript = "# 校验测试侧向量与 protocol/ 下的权威副本一致，防止两份副本漂移\n# dense/ 是 VD-D1 金图像，权威副本在 protocol/dense/golden，单独比对\nset -e\nSRC=\"${SRCROOT}/../protocol/vectors\"\nDST=\"${SRCROOT}/QrBinaryTests/vectors\"\nif [ -d \"$SRC\" ]; then\n  if ! diff -r -x dense \"$SRC\" \"$DST\" > /dev/null 2>&1; then\n    echo \"error: QrBinaryTests/vectors 与 protocol/vectors 不一致，请执行 cp protocol/vectors/* receiver/QrBinaryTests/vectors/\"\n    exit 1\n  fi\nfi\nGSRC=\"${SRCROOT}/../protocol/dense/golden\"\nGDST=\"${DST}/dense\"\nif [ -d \"$GSRC\" ]; then\n  if ! diff -r \"$GSRC\" \"$GDST\" > /dev/null 2>&1; then\n    echo \"error: QrBinaryTests/vectors/dense 与 protocol/dense/golden 不一致，请执行 python3 protocol/dense/gen_golden.py --sync\"\n    exit 1\n  fi\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -450,6 +450,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "QrBinary/DenseL1/QrBinary-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -483,6 +484,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "QrBinary/DenseL1/QrBinary-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";

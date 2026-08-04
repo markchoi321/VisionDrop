@@ -7,6 +7,7 @@
 
 import Testing
 import Foundation
+import QuartzCore
 @testable import QrBinary
 
 @MainActor
@@ -164,8 +165,14 @@ struct ClearAllTests {
             .appendingPathComponent("received", isDirectory: true)
     }
 
-    /// 造一个进行中的会话，同时留下进度文件
+    /// 造一个进行中的会话，同时留下进度文件。
+    ///
+    /// 先 clearAll 是必须的：本方法自己会把进度存盘，而本组用例并行跑、
+    /// 共用同一个 Documents 目录，新建的 FileReceiver 会把上一个用例存的
+    /// 同 sessionId 进度读回来。那样种子帧就成了重复块被丢弃，
+    /// 既不计吞吐也不进会话表，表现为随机失败。
     private func seedSession(_ receiver: FileReceiver) throws -> UInt32 {
+        receiver.clearAll()
         let stream = try Vectors.binary("stream.bin")
         let e2e = try Vectors.keyValues("e2e.txt")
         let T = Int(e2e["rlnc.T"]!)!, K = Int(e2e["rlnc.K"]!)!
@@ -221,12 +228,17 @@ struct ClearAllTests {
         #expect(!fm.fileExists(atPath: marker.path), "已接收文件必须一并删除")
     }
 
-    /// 速率读数也要清零，否则清空后界面还挂着上次的速率
+    /// 速率读数也要清零，否则清空后界面还挂着上次的速率。
+    ///
+    /// 读数一律传入 seed 之前的时刻：计量窗口只有 1 秒，而测试是并行跑的，
+    /// 机器负载高时 seedSession 到断言之间真能超过 1 秒，样本被窗口淘汰、
+    /// 首个断言假失败。这里要验的是 clearAll 的行为，不是墙钟。
     @Test func clearAllResetsThroughput() throws {
         let receiver = FileReceiver()
+        let t0 = CACurrentMediaTime()
         _ = try seedSession(receiver)
-        #expect(receiver.throughput.bytesPerSecond() > 0)
+        #expect(receiver.throughput.bytesPerSecond(now: t0) > 0)
         receiver.clearAll()
-        #expect(receiver.throughput.bytesPerSecond() == 0)
+        #expect(receiver.throughput.bytesPerSecond(now: t0) == 0)
     }
 }

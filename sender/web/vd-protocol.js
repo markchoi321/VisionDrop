@@ -276,25 +276,55 @@
     function epsLt(K) { return K <= 1 ? 0.0 : 1.85 / Math.pow(K, 0.37); }
 
     /* 返回 {codec, T, K, m, frames}；并列取舍：帧数 -> T 最小 -> 解方程优先 */
-    function pickParams(streamLen) {
-        var best = null;
+    /*
+     * 选参：在 T 上穷举，取一轮所需帧数最少的组合。
+     *
+     * maxCapacity 是**单个符号能装的净载荷字节数**，缺省是遗留容量表 v40 的值。
+     * 密集彩色页面必须传自己的容量（VDD.capacity(N).net），否则 T 是按遗留容量表
+     * 的容量挑的，套到色块码上就会剩下一截装不满的尾巴——那截补零格渲染出来
+     * 是纯黑，既占版面又不载信息。实测 T=488（按 QR 容量选出）在密集档位上的
+     * 利用率只有 80%–96%，N=80 档白白浪费 20%。
+     *
+     * 帧数目标本身就涵盖了利用率：frames ≈ K(1+eps)/m 而 m = floor((cap-20)/T)，
+     * 装得越满 m*T 越大、帧数越少，不必另加一项。
+     *
+     * 帧数相等时再按填充率打破平局，让符号在视觉上也是满的——但**这条只在
+     * 显式传了 maxCapacity 时生效**：缺省路径的选参被 protocol/vectors/ 的
+     * 跨实现向量逐字段钉死，多一条判据就会挑出不同的 T，与 refimpl.py 对不上。
+     */
+    function pickParams(streamLen, maxCapacity) {
+        var cap = maxCapacity || MAX_CAPACITY;
+        var tieByFill = !!maxCapacity;
+        var best = null, bestUtil = -1;
         for (var T = T_MIN; T <= T_MAX; T++) {
             var K = Math.max(1, Math.ceil(streamLen / T));
-            var m = Math.floor((MAX_CAPACITY - FRAME_HEADER_LEN) / T);
+            /* m 在帧头里占一个字节，上限 255 */
+            var m = Math.min(255, Math.floor((cap - FRAME_HEADER_LEN) / T));
             if (m < 1) { continue; }
+            var util = (FRAME_HEADER_LEN + m * T) / cap;
             var frames, cand;
             if (K <= K_MAX_RLNC && K <= 8 * T) {
                 frames = Math.ceil(Math.ceil(K * (1 + epsRlnc(K))) / m);
                 cand = [frames, T, CODEC_RLNC, K, m];
-                if (best === null || candLess(cand, best)) { best = cand; }
+                if (better(cand, util, best, bestUtil, tieByFill)) { best = cand; bestUtil = util; }
             }
             if (T >= T_MIN_LT) {
                 frames = Math.ceil(Math.ceil(K * (1 + epsLt(K))) / m);
                 cand = [frames, T, CODEC_LT, K, m];
-                if (best === null || candLess(cand, best)) { best = cand; }
+                if (better(cand, util, best, bestUtil, tieByFill)) { best = cand; bestUtil = util; }
             }
         }
-        return { codec: best[2], T: best[1], K: best[3], m: best[4], frames: best[0] };
+        return { codec: best[2], T: best[1], K: best[3], m: best[4], frames: best[0],
+                 fill: bestUtil };
+    }
+
+    /* 帧数优先；tieByFill 时帧数相同再比填充率，否则完全沿用既有次序 */
+    function better(cand, util, best, bestUtil, tieByFill) {
+        if (best === null) { return true; }
+        if (tieByFill && cand[0] === best[0] && util !== bestUtil) {
+            return util > bestUtil;
+        }
+        return candLess(cand, best);
     }
 
     function candLess(a, b) {
@@ -429,9 +459,13 @@
      *   content  文件内容 Uint8Array
      *   fileName 文件名
      */
-    function SendSession(content, fileName) {
+    /*
+     * maxCapacity 可选：单符号净载荷上限。密集彩色页面传 VDD 的容量，
+     * 让 T 按色块码来挑；缺省走遗留容量表，行为与既有向量一致。
+     */
+    function SendSession(content, fileName, maxCapacity) {
         var st = buildStream(content, fileName);
-        var p = pickParams(st.stream.length);
+        var p = pickParams(st.stream.length, maxCapacity);
         this.fileName = fileName;
         this.contentLen = content.length;
         this.stream = st.stream;
@@ -442,7 +476,8 @@
         this.K = p.K;
         this.framesPerPass = p.frames;
         this.sid = sessionId(st.contentSha, p.T, p.K, p.codec);
-        this.tiers = buildTiers(p.T);
+        /* 遗留档位阶梯只为跨实现向量保留，密集页面自建档位 */
+        this.tiers = maxCapacity ? [] : buildTiers(p.T);
         this.cdf = p.codec === CODEC_LT ? rsCdfQ(p.K) : null;
         /* 源块拼进一整块补零缓冲，第 i 块 = padded[i*T, (i+1)*T) */
         this.padded = new Uint8Array(p.K * p.T);
