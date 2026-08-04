@@ -38,6 +38,7 @@ private final class DecodeBox: @unchecked Sendable {
     private let lock = NSLock()
     private var _grid: Int32 = DenseDecoder.gridAuto
     private var _diagEnabled = false
+    private var _saveShots = false
     private var _wantDump = false
     private var _dumpURL: URL?
 
@@ -51,6 +52,12 @@ private final class DecodeBox: @unchecked Sendable {
     var diagEnabled: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _diagEnabled }
         set { lock.lock(); _diagEnabled = newValue; lock.unlock() }
+    }
+
+    /// 失败帧留样开关。界面写、decodeQueue 读，加锁
+    var saveShots: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _saveShots }
+        set { lock.lock(); _saveShots = newValue; lock.unlock() }
     }
 
     /// 请求把下一帧原始像素落盘（现场诊断用）
@@ -113,6 +120,63 @@ private final class DecodeBox: @unchecked Sendable {
 }
 
 /*
+ * 进程级资源占用采样。
+ *
+ * GPU 占用没有公开 API 可读（Metal 只能报自家的显存分配，而这条管线根本
+ * 不走 GPU——YUV->BGRA 是 ISP 硬件做的，解码全在 CPU）。与其编一个数出来，
+ * 不如报真正对应「发热」这个症状的东西：热状态。系统按它决定降频，
+ * 它一跳到 serious/critical，帧率下滑就有了解释。
+ *
+ * 三个读数都不便宜（task_threads 要分配一次端口数组），因此按秒采样，
+ * 逐帧复用上一次的结果。
+ */
+private struct SystemMetrics {
+    var cpuPercent: Double = 0      // 本进程所有线程合计，可超过 100
+    var memoryMB: Double = 0        // phys_footprint，与 Xcode 内存表读数同源
+    var thermal: Int = 0            // ProcessInfo.ThermalState 的 rawValue
+
+    static func sample() -> SystemMetrics {
+        var m = SystemMetrics()
+
+        var threadList: thread_act_array_t?
+        var threadCount: mach_msg_type_number_t = 0
+        if task_threads(mach_task_self_, &threadList, &threadCount) == KERN_SUCCESS,
+           let threads = threadList {
+            for i in 0..<Int(threadCount) {
+                var info = thread_basic_info()
+                /* THREAD_BASIC_INFO_COUNT 是 C 宏，Swift 里看不到，按结构体大小自己算 */
+                var count = mach_msg_type_number_t(
+                    MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+                let ok = withUnsafeMutablePointer(to: &info) {
+                    $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                        thread_info(threads[i], thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+                    }
+                }
+                if ok == KERN_SUCCESS, info.flags & TH_FLAGS_IDLE == 0 {
+                    m.cpuPercent += Double(info.cpu_usage) / Double(TH_USAGE_SCALE) * 100
+                }
+            }
+            vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: threads)),
+                          vm_size_t(Int(threadCount) * MemoryLayout<thread_t>.size))
+        }
+
+        var vmInfo = task_vm_info_data_t()
+        var vmCount = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let vmOK = withUnsafeMutablePointer(to: &vmInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vmCount)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &vmCount)
+            }
+        }
+        if vmOK == KERN_SUCCESS {
+            m.memoryMB = Double(vmInfo.phys_footprint) / (1024 * 1024)
+        }
+
+        m.thermal = ProcessInfo.processInfo.thermalState.rawValue
+        return m
+    }
+}
+
+/*
  * 扫描遥测日志。
  *
  * 真机上「纠错失败」占了失败帧的大头，但一个 VDD_ERR_RS 说明不了任何事：
@@ -141,6 +205,14 @@ private final class TelemetryLog: @unchecked Sendable {
          * 只能靠这一列定案。
          */
         var decodeMs: Double
+        /*
+         * 采集时间戳到进入解码队列的延迟。它和 decodeMs 分开才说明问题：
+         * 前者大说明采集管线或队列积压，后者大才是解码本身慢。
+         */
+        var latencyMs: Double
+        /// 解码完成到主 actor 真正执行 finish 的排队时长
+        var queueMs: Double
+        var metrics: SystemMetrics
     }
 
     /// 条数上限。30fps 扫十分钟约 18000 条，再多也没有分析价值，
@@ -182,7 +254,10 @@ private final class TelemetryLog: @unchecked Sendable {
         var s = "t_ms,result,grid,cell_px,beta,thr_r,thr_g,thr_b,"
         s += "halfgap_r,halfgap_g,halfgap_b,bow,header_disagree,payload_len,"
         s += "rs_blocks,rs_blocks_ok,rs_corrected,rs_erasures,"
-        s += "frame_bytes,duplicate,tracking,exposure_locked,decode_ms\n"
+        s += "frame_bytes,duplicate,tracking,exposure_locked,"
+        s += "latency_ms,decode_ms,queue_ms,"
+        s += "ms_find,ms_probe,ms_beta,ms_sample,ms_decide,ms_rs,ms_geom,ms_calib,"
+        s += "cpu_pct,mem_mb,thermal\n"
         s.reserveCapacity(snapshot.count * 128)
         for r in snapshot {
             let d = r.diag
@@ -195,7 +270,12 @@ private final class TelemetryLog: @unchecked Sendable {
             s += "\(d.rs_blocks),\(d.rs_blocks_ok),\(d.rs_corrected),\(d.rs_erasures),"
             s += "\(r.frameBytes),\(r.duplicate ? 1 : 0),"
             s += "\(r.tracking ? 1 : 0),\(r.exposureLocked ? 1 : 0),"
-            s += String(format: "%.1f\n", r.decodeMs)
+            s += String(format: "%.1f,%.1f,%.1f,", r.latencyMs, r.decodeMs, r.queueMs)
+            s += String(format: "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
+                        d.ms_find, d.ms_probe, d.ms_beta, d.ms_sample,
+                        d.ms_decide, d.ms_rs, d.ms_geom, d.ms_calib)
+            s += String(format: "%.1f,%.1f,%d\n",
+                        r.metrics.cpuPercent, r.metrics.memoryMB, r.metrics.thermal)
         }
         return s
     }
@@ -296,6 +376,11 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         get { box.diagEnabled }
         set { box.diagEnabled = newValue }
     }
+    /// 是否留存失败帧原图。仅在诊断模式下有意义，代价见 FileReceiver 的说明
+    var saveFailureFrames: Bool {
+        get { box.saveShots }
+        set { box.saveShots = newValue }
+    }
 
     /// 实际判别出的档位（0 = 尚未解出任何帧）
     @Published private(set) var detectedGrid: Int32 = 0
@@ -378,6 +463,9 @@ final class DenseCameraScanner: NSObject, ObservableObject,
     private let decodeQueue = DispatchQueue(label: "dense.decode", qos: .userInitiated)
     /// 留样落盘队列。串行 + 低优先级，绝不和解码抢 CPU
     private let dumpQueue = DispatchQueue(label: "dense.dump", qos: .utility)
+    /// 资源占用按秒采样，逐帧复用
+    private var metricsCache = SystemMetrics()
+    private var metricsAt: CFTimeInterval = 0
     private let box = DecodeBox()
     private var isRunning = false
     /// 连续解码成功次数，达到阈值即锁定 AE/AWB
@@ -581,6 +669,11 @@ final class DenseCameraScanner: NSObject, ObservableObject,
                                    from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        /* 采集时间戳到现在，即这一帧在采集管线与队列里待了多久 */
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let latencyMs = pts.isValid
+            ? max(0, (CACurrentMediaTime() - CMTimeGetSeconds(pts)) * 1000) : 0
+
         // 现场诊断：把这一帧原样落盘，可直接喂给 C 侧 harness 复现
         if box.takeDumpRequest(), let copy = copyBGRA(pixelBuffer) {
             let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -615,7 +708,7 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         /* 失败帧留样：CSV 只有数字，复现故障还得看像素。
            限量限频由 claimFailureShot 把关，文件名带上与 CSV 同源的 t_ms，
            便于把图和日志行对上。 */
-        if box.diagEnabled, let e = err,
+        if box.diagEnabled, box.saveShots, let e = err,
            let n = box.claimFailureShot(at: at, limit: kMaxFailureShots,
                                         minGap: kFailureShotGap),
            let copy = copyBGRA(pixelBuffer) {
@@ -629,14 +722,17 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         }
 
         Task { @MainActor [weak self] in
-            self?.finish(result, err, diag, tracking, at, decodeMs)
+            self?.finish(result, err, diag, tracking, at, decodeMs, latencyMs)
         }
     }
 
     private func finish(_ decoded: Data?, _ failure: DenseDecoder.Failure?,
                         _ diag: vdd_diag, _ tracking: Bool = false,
                         _ at: CFTimeInterval = CACurrentMediaTime(),
-                        _ decodeMs: Double = 0) {
+                        _ decodeMs: Double = 0,
+                        _ latencyMs: Double = 0) {
+        /* 这一跳的排队时长：解码在采集队列上结束于 at，这里才真正跑起来 */
+        let queueMs = max(0, (CACurrentMediaTime() - at) * 1000)
         processedMeter.record()
         var duplicate = false
         defer {
@@ -651,7 +747,10 @@ final class DenseCameraScanner: NSObject, ObservableObject,
                     duplicate: duplicate,
                     tracking: tracking,
                     exposureLocked: isLocked,
-                    decodeMs: decodeMs))
+                    decodeMs: decodeMs,
+                    latencyMs: latencyMs,
+                    queueMs: queueMs,
+                    metrics: sampledMetrics(at)))
             }
         }
 
@@ -700,6 +799,15 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         /* 有效速率：只有过了去重的帧才算，这才是真正推进传输的字节 */
         netByteMeter.record(bytes: frame.count)
         onFrameDecoded?(frame)
+    }
+
+    /// 资源占用每秒采一次，其余帧复用上一次的读数（采样本身不便宜）
+    private func sampledMetrics(_ now: CFTimeInterval) -> SystemMetrics {
+        if now - metricsAt >= 1.0 {
+            metricsCache = SystemMetrics.sample()
+            metricsAt = now
+        }
+        return metricsCache
     }
 
     private static func describe(_ f: DenseDecoder.Failure?) -> String {

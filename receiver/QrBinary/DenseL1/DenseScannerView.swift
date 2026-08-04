@@ -114,7 +114,7 @@ struct DenseScannerView: View {
                         Button("导出诊断帧") { scanner.dumpNextFrame() }
                         /* 诊断包 = 逐帧遥测 CSV + 最多 10 张失败帧原图。
                            CSV 定位卡在哪一环，原图用来复现 */
-                        Button("导出诊断包（\(scanner.logCount) 条 / \(scanner.failureShotCount) 张）") {
+                        Button("导出诊断包（\(scanner.logCount) 条 / \(scanner.failureShotCount) 图）") {
                             scanner.exportTelemetry()
                         }
                         .disabled(!receiver.diagnosticsEnabled)
@@ -127,6 +127,7 @@ struct DenseScannerView: View {
                 scanner.grid = grid
                 scanner.resolution = receiver.scanResolution
                 scanner.diagnosticsEnabled = receiver.diagnosticsEnabled
+                scanner.saveFailureFrames = receiver.diagnosticsEnabled && receiver.saveFailureFrames
                 scanner.onFrameDecoded = { [weak receiver] frame in
                     guard let receiver = receiver else { return }
                     Task { @MainActor in

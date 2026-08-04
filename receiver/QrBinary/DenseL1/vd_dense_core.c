@@ -11,6 +11,19 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/*
+ * 分阶段计时。clock_gettime 单次约几十纳秒，一帧七八次可以忽略，因此无条件
+ * 开着——需要的时候没有数据，比常态多花这点时间糟糕得多。累加器是线程局部的，
+ * 与文件里其他可变 static 的处置一致（见 README 的线程安全一节）。
+ */
+static double clk_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+static _Thread_local double g_ms_geom, g_ms_calib;
 
 /* ---------------------------------------------------------------- 常量 */
 
@@ -1409,11 +1422,17 @@ static int probe_grid(const vdd_image *img, int n, double corners[4][2],
     g->cell_px = sqrt(dx * dx + dy * dy) / (diag_cells > 1 ? diag_cells : 1);
 
     /* 用边框环标定边缘弓曲，补上单应性表达不了的径向畸变（带自校验闸门）*/
+    double t0 = clk_ms();
     refine_edges_guarded(img, g);
-    if (calib_thresholds(img, g, out->thr, out->halfgap) != 0)
+    double t1 = clk_ms();
+    g_ms_geom += t1 - t0;
+    if (calib_thresholds(img, g, out->thr, out->halfgap) != 0) {
+        g_ms_calib += clk_ms() - t1;
         return VDD_ERR_CALIB;
+    }
 
     build_palette(img, g, &out->pal);
+    g_ms_calib += clk_ms() - t1;
 
     free_cells(n, free_idx);
     uint8_t head[5];
@@ -1458,6 +1477,11 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
     if (!img || !img->pixels || !frame_out) return VDD_ERR_ARGS;
     if (n_grid != VDD_GRID_AUTO && !is_valid_grid(n_grid)) return VDD_ERR_ARGS;
     gf_init();
+    g_ms_geom = 0;
+    g_ms_calib = 0;
+    double t_stage = clk_ms();
+    double ms_find = 0, ms_probe = 0, ms_beta = 0;
+    double ms_sample = 0, ms_decide = 0, ms_rs = 0;
 
     double corners[4][2];
     if (find_finders(img, lock, corners) != 0) {
@@ -1471,6 +1495,9 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
             return VDD_ERR_FINDER;
         }
     }
+
+    ms_find = clk_ms() - t_stage;
+    t_stage = clk_ms();
 
     int32_t *free_idx = (int32_t *)malloc((size_t)N_MAX * N_MAX * sizeof(int32_t));
     if (!free_idx) return VDD_ERR_NOMEM;
@@ -1518,6 +1545,8 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
             if (stage > best_stage) { best_stage = stage; rc = r; best_pr = pr; }
         }
     }
+    ms_probe = clk_ms() - t_stage;
+    t_stage = clk_ms();
     if (rc == 0) memcpy(corners, oc, sizeof oc);   /* oc 即成功那次的朝向 */
     if (rc != 0) {
         if (diag) {
@@ -1528,6 +1557,11 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
                 diag->thr[ch] = best_pr.thr[ch];
                 diag->halfgap[ch] = best_pr.halfgap[ch];
             }
+            /* 走到哪算到哪：判别阶段就失败时，恰恰最需要知道时间花在哪 */
+            diag->ms_find = ms_find;
+            diag->ms_probe = ms_probe;
+            diag->ms_geom = g_ms_geom;
+            diag->ms_calib = g_ms_calib;
         }
         free(free_idx);
         if (lock) lock->valid = 0;
@@ -1545,6 +1579,8 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
     } else {
         refine_beta(img, &geom);
     }
+    ms_beta = clk_ms() - t_stage;
+    t_stage = clk_ms();
 
     double *thr = pr.thr, *halfgap = pr.halfgap;
 
@@ -1561,6 +1597,9 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
     for (int r = 0; r < n; r++)
         for (int c = 0; c < n; c++)
             sample_cell(img, &geom, c + 0.5, r + 0.5, &cellp[(r * n + c) * 3]);
+
+    ms_sample = clk_ms() - t_stage;
+    t_stage = clk_ms();
 
     int n_free = free_cells(n, free_idx);
 
@@ -1626,6 +1665,8 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
             cellv[r * n + c] = (uint8_t)v;
         }
     }
+    ms_decide = clk_ms() - t_stage;
+    t_stage = clk_ms();
 
     if (diag) {
         diag->grid = n;
@@ -1679,7 +1720,19 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
         /* 与下面的纠错失败出口一致：不动跟踪锁，几何是对的。
            rs_erasures 这里报的是未截断的候选数，读数远超 nb*RS_ERAS_MAX
            即可认定是这条路径。 */
-        if (diag) { diag->rs_blocks = nb; diag->rs_erasures = n_bad; }
+        ms_rs = clk_ms() - t_stage;
+        if (diag) {
+            diag->rs_blocks = nb;
+            diag->rs_erasures = n_bad;
+        diag->ms_find = ms_find;
+        diag->ms_probe = ms_probe;
+        diag->ms_beta = ms_beta;
+        diag->ms_geom = g_ms_geom;
+        diag->ms_calib = g_ms_calib;
+        diag->ms_sample = ms_sample;
+        diag->ms_decide = ms_decide;
+        diag->ms_rs = ms_rs;
+        }
         free(ws); free(free_idx);
         return VDD_ERR_SIGNAL;
     }
@@ -1777,8 +1830,31 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
     if (rs_failed) {
         /* 不动跟踪锁：几何是对的（头部已过），只是这一帧信噪比不够，
            丢锁反而会让下一帧退回全图搜索 —— 沿用改造前的行为 */
+        ms_rs = clk_ms() - t_stage;
+        if (diag) {
+        diag->ms_find = ms_find;
+        diag->ms_probe = ms_probe;
+        diag->ms_beta = ms_beta;
+        diag->ms_geom = g_ms_geom;
+        diag->ms_calib = g_ms_calib;
+        diag->ms_sample = ms_sample;
+        diag->ms_decide = ms_decide;
+        diag->ms_rs = ms_rs;
+        }
         free(ws); free(free_idx);
         return VDD_ERR_RS;
+    }
+
+    ms_rs = clk_ms() - t_stage;
+    if (diag) {
+        diag->ms_find = ms_find;
+        diag->ms_probe = ms_probe;
+        diag->ms_beta = ms_beta;
+        diag->ms_geom = g_ms_geom;
+        diag->ms_calib = g_ms_calib;
+        diag->ms_sample = ms_sample;
+        diag->ms_decide = ms_decide;
+        diag->ms_rs = ms_rs;
     }
 
     if (lock) {

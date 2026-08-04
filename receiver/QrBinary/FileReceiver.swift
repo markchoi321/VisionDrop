@@ -96,6 +96,12 @@ class FileReceiver: ObservableObject {
      * 即便挪到后台队列也是实打实的内存与 IO 开销，常规传输不该付这个钱。
      */
     @Published var diagnosticsEnabled: Bool = false
+    /*
+     * 失败帧留样。单列一个开关而不是跟着诊断模式走：遥测 CSV 一帧才百来字节，
+     * 留样一张 4K BMP 是 24 MB，两者的代价差着五个数量级。多数分析只要 CSV，
+     * 只有需要复现某一帧的像素时才值得开这个。
+     */
+    @Published var saveFailureFrames: Bool = false
     /// 会话内部状态变化时递增，驱动 SwiftUI 刷新（ReceiveSession 是引用类型）
     @Published var revision: Int = 0
 

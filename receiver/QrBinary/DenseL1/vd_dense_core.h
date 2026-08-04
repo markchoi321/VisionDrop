@@ -79,6 +79,22 @@ typedef struct {
     int rs_blocks_ok;           /* 纠错通过的块数 */
     int rs_corrected;           /* 通过的块里纠正的字节数合计 */
     int rs_erasures;            /* 实际喂给 RS 的擦除标记总数（全部块合计） */
+    /*
+     * 分阶段耗时（毫秒）。只有总耗时的话，看到「4K 一帧 20 ms」也不知道该优化
+     * 什么——各段占比随分辨率与档位差得很远。失败帧同样回填，走到哪算到哪。
+     *
+     * 前六项互不重叠，加起来约等于整帧耗时：
+     *   find -> probe -> beta -> sample -> decide -> rs
+     * 后两项是 probe 内部的细分，与 probe 重叠，不要重复计入总和。
+     */
+    double ms_find;             /* 定位图形搜索，含局部自适应阈值 */
+    double ms_probe;            /* 档位与朝向判别，逐候选试解头部 */
+    double ms_beta;             /* 横向形状参数标定，仅建锁首帧执行 */
+    double ms_sample;           /* 逐格采样 */
+    double ms_decide;           /* 偏移校正与八色判决 */
+    double ms_rs;               /* 解交织与 RS errata 纠错 */
+    double ms_geom;             /* [probe 内] 边缘校正，所有候选合计 */
+    double ms_calib;            /* [probe 内] 定标条阈值与八色调色板，所有候选合计 */
 } vdd_diag;
 
 /*

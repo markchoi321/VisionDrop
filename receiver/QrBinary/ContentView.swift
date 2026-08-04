@@ -80,6 +80,19 @@ struct ContentView: View {
                 }
             }
 
+            /* 留样单列一个开关：CSV 一帧百来字节，一张 4K BMP 是 24 MB */
+            if receiver.diagnosticsEnabled {
+                Toggle(isOn: $receiver.saveFailureFrames) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("留存失败帧原图").font(.caption)
+                        Text("最多 10 张，可喂给 C 侧 harness 复现；4K 下每张约 24 MB")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.leading, 16)
+            }
+
             // 采样混叠模型：每个符号的期望扫描次数 N = 间隔 x 帧率 / 1000，经验阈值 2.5
             Text(scanRateHint)
                 .font(.caption2)
