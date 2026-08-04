@@ -139,15 +139,22 @@ final class ReceiveSession: Identifiable {
         return gained
     }
 
-    /// 解出块 0 起的连续源块后即可解析 StreamHeader；解方程方案要到完成才有源块
+    /*
+     * 解出块 0 起的连续源块后即可解析 StreamHeader。
+     *
+     * 剥洋葱方案边收边解，源块是现成的，凑够头部长度就能读出文件名。
+     * 解方程方案不行：源块要等回代才有，而回代是 O(K^2) 次块异或，1 MB 的
+     * 文件 K=2098、Release 约 26 ms、Debug 达 6 秒。这个函数跑在主 actor 上，
+     * 曾经在这里直接调 assemble()——于是「刚好收齐最后一块」的那一帧整个界面
+     * 冻住数秒，而且这份回代结果转手就扔了，用户点合并时还要再算一遍。
+     *
+     * 现在解方程方案在这里什么都不做，文件名等合并时由 finalizeContent 填。
+     * 收齐后不自动合并本来就是既定取舍（合并时长不可预测，交给用户触发），
+     * 为了早几秒显示一个文件名而在主线程上跑一次完整回代，方向就错了。
+     */
     func tryExtractMeta() {
         guard meta == nil else { return }
-        guard let peeling = decoder as? PeelingDecoder else {
-            if decoder.isComplete, let m = try? StreamCodec.parseHeader(decoder.assemble()) {
-                meta = m
-            }
-            return
-        }
+        guard let peeling = decoder as? PeelingDecoder else { return }
         var buf = [UInt8]()
         var i = 0
         // 连续块凑够 54 + fileNameLen 即可解析出头部

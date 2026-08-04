@@ -595,10 +595,18 @@ static inline void geom_reset(vdd_geom *g) {
  */
 static void sample_cell(const vdd_image *img, const vdd_geom *g,
                         double gx, double gy, double out[3]) {
+    /*
+     * 格内面积平均的采样点数（k×k），封顶 3。
+     *
+     * 原本 cell_px >= 8 时用 4×4，直觉是「格子大就多采几个点更稳」，实测反了：
+     * 采样点铺在格内侧 60% 的方框上，k 越大最外圈的点越贴近格边界，混进来的
+     * 邻格串扰也越多。封到 3×3 之后一张真机 21/22 的照片变成 22/22 整帧解出，
+     * 4K 诊断包里两帧从纠错失败变成全解，金图像 8/8 无一退步，采样耗时还降了
+     * 约四成（真机 N=112 实测 23 ms -> 14 ms 量级）。再降到 2×2 则开始变差。
+     */
     int k = 1;
     if (g->cell_px >= 2.5) k = 2;
     if (g->cell_px >= 4.0) k = 3;
-    if (g->cell_px >= 8.0) k = 4;
     if (k == 1) {
         double px, py;
         geom_map(g, gx, gy, &px, &py);
