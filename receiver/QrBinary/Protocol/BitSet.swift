@@ -30,6 +30,15 @@ struct BitSet {
         maskTail()
     }
 
+    /// 用底层字数组直接构造（进度文件的稠密系数位图走这条路）
+    init(bitCount: Int, words64: [UInt64]) {
+        self.init(bitCount: bitCount)
+        for (i, w) in words64.enumerated() where i < words.count {
+            words[i] = w
+        }
+        maskTail()
+    }
+
     /// 清掉超出 bitCount 的高位
     private mutating func maskTail() {
         let rem = bitCount & 63

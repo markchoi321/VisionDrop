@@ -25,7 +25,14 @@ enum ProgressStoreError: Error, LocalizedError {
 enum ProgressStore {
 
     static let magic: [UInt8] = [0x56, 0x44, 0x50, 0x47]     // "VDPG"
-    static let formatVersion: UInt16 = 1
+    /*
+     * 版本 2：未消元记录改为按稀疏度分别编码（见 PendingRecord）。
+     * RLNC 的稠密系数向量原来逐个置位写 3 字节索引，K=2517 时整个基约 10MB，
+     * 自动存盘要 300ms+；改用位图后同样的基约 1MB。
+     * 版本 1 的文件不再读取——进度文件是可再生的临时状态，
+     * 加迁移代码的价值低于把格式保持简单。
+     */
+    static let formatVersion: UInt16 = 2
     static let statsLength = 40
 
     // MARK: - 目录
@@ -39,7 +46,7 @@ enum ProgressStore {
         directory.appendingPathComponent("\(SessionId.hex(sessionId)).vdpg")
     }
 
-    private static func ensureDirectory() throws {
+    static func ensureDirectory() throws {
         let dir = directory
         if !FileManager.default.fileExists(atPath: dir.path) {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -84,8 +91,15 @@ enum ProgressStore {
         ByteOps.appendUInt32(&out, UInt32(pending.count))
         for rec in pending {
             ByteOps.appendUInt32(&out, rec.blockId)
-            ByteOps.appendUInt16(&out, UInt16(rec.neighbors.count))
-            for i in rec.neighbors { ByteOps.appendUInt24(&out, UInt32(i)) }
+            if let bits = rec.coeff {
+                out.append(1)                                   // 1 = 稠密位图
+                ByteOps.appendUInt24(&out, UInt32(bits.bitCount))
+                for w in bits.words { ByteOps.appendUInt64(&out, w) }
+            } else {
+                out.append(0)                                   // 0 = 稀疏索引表
+                ByteOps.appendUInt16(&out, UInt16(rec.neighbors.count))
+                for i in rec.neighbors { ByteOps.appendUInt24(&out, UInt32(i)) }
+            }
             out.append(contentsOf: rec.payload)
         }
 
@@ -159,17 +173,35 @@ enum ProgressStore {
         var pending: [PendingRecord] = []
         pending.reserveCapacity(pendingCount)
         for _ in 0..<pendingCount {
-            try need(6)
+            try need(5)
             let blockId = ByteOps.readUInt32(b, off); off += 4
-            let degree = Int(ByteOps.readUInt16(b, off)); off += 2
-            try need(degree * 3 + T)
-            var neighbors: [Int] = []
-            neighbors.reserveCapacity(degree)
-            for _ in 0..<degree {
-                neighbors.append(Int(ByteOps.readUInt24(b, off))); off += 3
+            let kind = b[off]; off += 1
+            if kind == 1 {
+                try need(3)
+                let bitCount = Int(ByteOps.readUInt24(b, off)); off += 3
+                let wordCount = (bitCount + 63) / 64
+                try need(wordCount * 8 + T)
+                var words: [UInt64] = []
+                words.reserveCapacity(wordCount)
+                for _ in 0..<wordCount {
+                    words.append(ByteOps.readUInt64(b, off)); off += 8
+                }
+                pending.append(PendingRecord(
+                    blockId: blockId,
+                    coeff: BitSet(bitCount: bitCount, words64: words),
+                    payload: Array(b[off..<(off + T)])))
+            } else {
+                try need(2)
+                let degree = Int(ByteOps.readUInt16(b, off)); off += 2
+                try need(degree * 3 + T)
+                var neighbors: [Int] = []
+                neighbors.reserveCapacity(degree)
+                for _ in 0..<degree {
+                    neighbors.append(Int(ByteOps.readUInt24(b, off))); off += 3
+                }
+                pending.append(PendingRecord(blockId: blockId, neighbors: neighbors,
+                                             payload: Array(b[off..<(off + T)])))
             }
-            pending.append(PendingRecord(blockId: blockId, neighbors: neighbors,
-                                         payload: Array(b[off..<(off + T)])))
             off += T
         }
 

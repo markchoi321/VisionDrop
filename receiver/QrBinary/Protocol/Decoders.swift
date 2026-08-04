@@ -10,10 +10,28 @@ import Foundation
 
 /// 未消解编码块的持久化记录。
 /// 解方程会话中语义不同：blockId 存 pivot 索引，neighbors 存系数向量置 1 的索引。
+/*
+ * 未消元记录。两种解码器的系数表示稀疏度相反，因此并存两种载体，
+ * 同一时刻只用其中一个：
+ * - 剥洋葱(LT)：邻居表稀疏（度数个位数），用 neighbors 索引列表最省；
+ * - 解方程(RLNC)：消元基的系数向量稠密（约 K/2 位），用 coeff 位图。
+ *   早先它也走 neighbors，每个置位写 3 字节索引，K=2517 时单行就要 3.7KB、
+ *   整个基约 10MB，每次自动存盘要 300ms+ 并且卡在主 actor 上。
+ */
 struct PendingRecord {
     let blockId: UInt32
+    /// 稀疏邻居表（LT 用）；RLNC 走 coeff 时为空
     let neighbors: [Int]
+    /// 稠密系数位图（RLNC 用）；LT 为 nil
+    let coeff: BitSet?
     let payload: [UInt8]
+
+    init(blockId: UInt32, neighbors: [Int] = [], coeff: BitSet? = nil, payload: [UInt8]) {
+        self.blockId = blockId
+        self.neighbors = neighbors
+        self.coeff = coeff
+        self.payload = payload
+    }
 }
 
 struct SolvedRecord {
@@ -153,7 +171,7 @@ final class LinearSolveDecoder: BlockDecoder {
         out.reserveCapacity(rank)
         for p in 0..<K {
             guard let c = basisCoeff[p], let d = basisData[p] else { continue }
-            out.append(PendingRecord(blockId: UInt32(p), neighbors: c.indices, payload: d))
+            out.append(PendingRecord(blockId: UInt32(p), coeff: c, payload: d))
         }
         return out
     }
@@ -166,9 +184,14 @@ final class LinearSolveDecoder: BlockDecoder {
             guard p >= 0, p < K, rec.payload.count == T else { dropped += 1; continue }
             var c = BitSet(bitCount: K)
             var ok = true
-            for i in rec.neighbors {
-                if i < 0 || i >= K { ok = false; break }
-                c.set(i)
+            if let bits = rec.coeff {
+                /* 位图直接用，但位数必须与本会话的 K 一致，否则文件与会话对不上 */
+                if bits.bitCount == K { c = bits } else { ok = false }
+            } else {
+                for i in rec.neighbors {
+                    if i < 0 || i >= K { ok = false; break }
+                    c.set(i)
+                }
             }
             // pivot 必须是系数向量的最高位，否则文件已损坏
             guard ok, c.highestBit == p else { dropped += 1; continue }

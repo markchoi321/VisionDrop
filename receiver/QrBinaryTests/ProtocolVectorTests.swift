@@ -484,6 +484,38 @@ struct ProgressStoreTests {
     @Test func linearSolveProgressRoundTrip() throws { try roundTrip(codec: .linearSolve) }
     @Test func peelingProgressRoundTrip() throws { try roundTrip(codec: .peeling) }
 
+    /*
+     * 稠密系数向量必须用位图存，不能退回索引表。
+     *
+     * 真机上「进度写盘偏慢 300ms+」的根因就在这里：RLNC 的消元基是稠密的
+     * （约 K/2 位置位），早先每个置位写 3 字节索引，K 一大整个基就到 10MB 量级，
+     * 每 5 秒的自动存盘直接卡住主 actor。这条测试锁住编码体积的量级，
+     * 防止哪天有人把它改回索引表。
+     */
+    @Test func denseCoefficientsStayCompact() throws {
+        let K = 600, T = 200
+        let session = ReceiveSession(sessionId: 0xC0FFEE, K: K, T: T,
+                                     codec: .linearSolve, compressed: false)
+        let composer = LinearSolveComposer(K: K)
+        var content = [UInt8](repeating: 0, count: K * T)
+        var s = Prng.mix32(UInt32(K))
+        for i in 0..<content.count { s = Prng.xorshift32(s); content[i] = UInt8(s & 0xFF) }
+        let src = TestEncoder.splitSourceBlocks(content, K: K, T: T)
+        /* 灌到基本填满，此时消元基最稠密、编码体积最大 */
+        for bid in 0..<UInt32(K) {
+            _ = session.decoder.add(blockId: bid,
+                                    payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T))
+        }
+        let size = ProgressStore.encode([session]).count
+        /* 位图上界：每行 = 4 blockId + 1 标签 + 3 位数 + ceil(K/64)*8 + T */
+        let perRow = 4 + 1 + 3 + (K + 63) / 64 * 8 + T
+        #expect(size < perRow * K + 4096, "编码体积 \(size) 超出位图上界")
+        /* 索引表下界：稠密向量约 K/2 个置位，每个 3 字节 */
+        let indexFormLower = (K / 2 * 3 + T) * K
+        #expect(size < indexFormLower / 2,
+                "编码体积 \(size) 接近索引表量级 \(indexFormLower)，位图可能失效了")
+    }
+
     @Test func diskRoundTripAndCleanup() throws {
         let e2e = try Vectors.keyValues("e2e.txt")
         let T = Int(e2e["lt.T"]!)!
