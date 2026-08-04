@@ -475,8 +475,14 @@ final class DenseCameraScanner: NSObject, ObservableObject,
     private var recentHashes = Set<Int>()
 
     private static let lockAfterSuccesses = 3
-    /* 约 1 秒的连续失败即放开曝光锁：短于此会被偶发丢帧误触发 */
+    /* 约 1 秒的连续失败即放开曝光与对焦锁：短于此会被偶发丢帧误触发 */
     private static let unlockAfterFailures = 30
+    /*
+     * 连续失败到这个数就先补一次单次对焦。真机上「突然一直解不出」多数是失焦，
+     * 而不是取景不对；主动触发一次搜索比干等持续自动对焦自己察觉快得多。
+     * 取值明显小于解锁阈值：先试成本低的（重新合焦），不行再退回全自动。
+     */
+    private static let refocusAfterFailures = 8
 
     func start() {
         guard !isRunning else { return }
@@ -633,6 +639,19 @@ final class DenseCameraScanner: NSObject, ObservableObject,
 
         if dev.isWhiteBalanceModeSupported(.locked) { dev.whiteBalanceMode = .locked }
 
+        /*
+         * 连同镜头位置一起锁死。
+         *
+         * 这和早先那个「一开始就锁焦」的 bug 不是一回事：那次是从第一帧就把
+         * 焦距钉住，手持距离一变就再也解不出。这里是**已经连续解出若干帧**之后
+         * 才锁——此刻的镜头位置被实测证明可用，锁住是为了掐掉持续自动对焦的
+         * 来回搜索，那个搜索过程本身会产出一串糊帧。连续失败会走 unlockDevice
+         * 放开，重新自动对焦，所以换距离仍然跟得上。
+         */
+        if dev.isFocusModeSupported(.locked) {
+            dev.setFocusModeLocked(lensPosition: dev.lensPosition, completionHandler: nil)
+        }
+
         let cap = CMTime(seconds: Self.maxExposureSeconds, preferredTimescale: 1_000_000)
         let cur = dev.exposureDuration
         if dev.isExposureModeSupported(.custom), CMTimeCompare(cur, cap) > 0 {
@@ -643,6 +662,22 @@ final class DenseCameraScanner: NSObject, ObservableObject,
             dev.setExposureModeCustom(duration: cap, iso: iso, completionHandler: nil)
         } else if dev.isExposureModeSupported(.locked) {
             dev.exposureMode = .locked
+        }
+    }
+
+    /*
+     * 强制重新合焦一次。连续失败但还没到解锁阈值时调用——多数「突然解不出」
+     * 是失焦而非取景问题，主动触发一次单次自动对焦比干等持续自动对焦自己
+     * 察觉要快。仅在 sessionQueue 上执行。
+     */
+    private nonisolated func refocus() {
+        guard let dev = box.device, (try? dev.lockForConfiguration()) != nil else { return }
+        defer { dev.unlockForConfiguration() }
+        if dev.isFocusPointOfInterestSupported {
+            dev.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+        }
+        if dev.isFocusModeSupported(.autoFocus) {
+            dev.focusMode = .autoFocus            /* 单次搜索，完成后自己停住 */
         }
     }
 
@@ -763,6 +798,8 @@ final class DenseCameraScanner: NSObject, ObservableObject,
                 isLocked = false
                 failStreak = 0
                 sessionQueue.async { [weak self] in self?.unlockDevice() }
+            } else if isLocked && failStreak == Self.refocusAfterFailures {
+                sessionQueue.async { [weak self] in self?.refocus() }
             }
             lastFailure = Self.describe(failure)
             /* 失败时也把测得的几何与对比度显示出来——判断是几何没对上
