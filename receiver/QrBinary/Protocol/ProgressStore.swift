@@ -84,8 +84,13 @@ enum ProgressStore {
         var lastSeenAt: Double
     }
 
-    /// 在主 actor 上取快照。只读解码器，不做编码。
-    static func snapshot(_ s: ReceiveSession) -> SessionSnapshot {
+    /*
+     * 组装快照。解码器部分由调用方在 workQueue 上取好传进来——解码器的归属
+     * 在那条队列上，主 actor 不许直接碰。
+     */
+    static func snapshot(_ s: ReceiveSession,
+                         solved: [SolvedRecord],
+                         pending: [PendingRecord]) -> SessionSnapshot {
         var flags: UInt8 = 0
         if s.compressed { flags |= 0x01 }
         if s.meta != nil { flags |= 0x02 }
@@ -93,8 +98,8 @@ enum ProgressStore {
         return SessionSnapshot(
             sessionId: s.sessionId, K: s.K, T: s.T, flags: flags,
             metaBytes: s.meta?.rawHeader ?? [],
-            solved: s.decoder.snapshotSolved(),
-            pending: s.decoder.snapshotPending(),
+            solved: solved,
+            pending: pending,
             framesAccepted: s.stats.framesAccepted,
             framesRejected: s.stats.framesRejected,
             blocksReceived: s.stats.blocksReceived,
@@ -105,8 +110,13 @@ enum ProgressStore {
     }
 
     /// 打包多个会话，sessionCount 可 > 1，用于跨设备迁移导出
+    /// 便利重载：同步取快照后编码。会短暂占用 workQueue，仅用于测试与导出。
     static func encode(_ sessions: [ReceiveSession]) -> Data {
-        encode(sessions.map(snapshot))
+        encode(sessions.map { s in
+            s.withDecoderSync { d in
+                snapshot(s, solved: d.snapshotSolved(), pending: d.snapshotPending())
+            }
+        })
     }
 
     /// 快照 -> 字节。纯数据变换，可在任意线程执行
@@ -267,7 +277,7 @@ enum ProgressStore {
         let session = ReceiveSession(sessionId: sessionId, K: K, T: T,
                                      codec: codec, compressed: compressed, stats: stats)
         session.meta = meta
-        session.decoder.restore(solved: solved, pending: pending)
+        session.restoreProgress(solved: solved, pending: pending)
         session.lastSavedAt = Date()
         return (session, off)
     }

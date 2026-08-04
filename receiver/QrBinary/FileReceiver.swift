@@ -113,6 +113,8 @@ class FileReceiver: ObservableObject {
     /// 进度文件写盘队列。串行，保证同一会话的先后两次写入不会乱序
     private let ioQueue = DispatchQueue(label: "vd.progress.io", qos: .utility)
     private var backgroundObserver: NSObjectProtocol?
+    /// 尚未回调的消元任务数。测试用它等待异步路径跑完，见 drainForTests
+    private var pendingIngests = 0
 
     init() {
         /*
@@ -213,25 +215,34 @@ class FileReceiver: ObservableObject {
             return false
         }
 
-        // 只把去重后新增的块计入速率，重复帧不算（见 ThroughputMeter 的说明）
-        let uniqueBefore = session.stats.blocksUnique
-        let gained = session.ingest(frame)
-        let newBlocks = session.stats.blocksUnique - uniqueBefore
-        if newBlocks > 0 {
-            throughput.record(bytes: newBlocks * session.T)
-        }
-        revision &+= 1
+        /*
+         * 消元在 ReceiveSession.workQueue 上做，这里立刻返回。
+         *
+         * 返回值不再表示「这一帧有没有新块」——那要等消元跑完才知道，而等待
+         * 就等于把界面重新绑回解码速度。上层只用它判断「帧被接受了」，
+         * 真正的进度由下面的回调推进。
+         */
+        pendingIngests += 1
+        session.ingest(frame) { [weak self] r in
+            guard let self else { return }
+            self.pendingIngests -= 1
+            session.apply(r)
+            if r.received > r.duplicate {
+                self.throughput.record(bytes: (r.received - r.duplicate) * session.T)
+            }
+            self.revision &+= 1
 
-        if session.isComplete && !session.isFinished {
-            // 收齐后不自动合并：合并是一次时长不可预测的 CPU 任务（解方程的回代是 O(K^2)），
-            // 交给用户在主界面手动触发，避免它在传输刚结束时突然占住机器。
-            // 但必须立刻落一次盘，否则退出后这些块就白收了。
-            persist(session)
-            addLog("已收齐 \(session.displayName)：\(session.K) 个源块，等待手动合并")
-        } else if gained, Date().timeIntervalSince(session.lastSavedAt) > autoSaveInterval {
-            persist(session)
+            if r.complete && !session.isFinished && !session.completionAnnounced {
+                session.completionAnnounced = true
+                // 收齐后不自动合并：合并是一次时长不可预测的 CPU 任务（解方程的回代是
+                // O(K^2)），交给用户在主界面手动触发。但必须立刻落一次盘。
+                self.persist(session)
+                self.addLog("已收齐 \(session.displayName)：\(session.K) 个源块，等待手动合并")
+            } else if r.gained, Date().timeIntervalSince(session.lastSavedAt) > self.autoSaveInterval {
+                self.persist(session)
+            }
         }
-        return gained
+        return true
     }
 
     /// 完成：拼接 -> parseStream -> 解压 -> 校验 SHA-256 -> 落盘 -> 删除进度文件
@@ -248,15 +259,15 @@ class FileReceiver: ObservableObject {
         session.finalizeCancel = cancelFlag
         let startedAt = Date()
         let sessionId = session.sessionId
-        let decoder = session.decoder
         addLog("开始还原 \(SessionId.hex(sessionId))：K=\(session.K) T=\(session.T) \(session.codec.displayName)")
 
-        Task.detached(priority: .userInitiated) {
+        /* 合并与收块共用同一条串行队列：两者都独占解码器，真并发起来就是数据竞争 */
+        session.workQueue.async {
             var tAssemble = 0.0, tParse = 0.0, tHash = 0.0, tWrite = 0.0
             let outcome: Result<(StreamMeta, Int, URL), Error>
             do {
                 var mark = Date()
-                let assembled = decoder.assemble(
+                let assembled = session.assembleOnWorkQueue(
                     progress: { p in
                         Task { @MainActor in session.finalizeProgress = p }
                     },
@@ -285,7 +296,7 @@ class FileReceiver: ObservableObject {
                 outcome = .failure(error)
             }
 
-            await MainActor.run { [weak self] in
+            Task { @MainActor [weak self] in
                 session.isFinalizing = false
                 session.finalizeProgress = 0
                 session.finalizeCancel = nil
@@ -297,7 +308,7 @@ class FileReceiver: ObservableObject {
                     session.finalSize = size
                     // 中间态到此为止：编码块 / 源块 / 消元基全部释放，
                     // 大文件下这部分是文件本身的 1.3–1.5 倍，留着会一直压着内存
-                    session.decoder.releaseStorage()
+                    session.releaseStorage()
                     ProgressStore.remove(sessionId: sessionId)
                     self?.addLog("接收完成：\(meta.fileName)（\(size) 字节，SHA-256 通过）")
                     self?.addLog(String(format: "  耗时 合计%dms = 拼接%.0f + 解流%.0f + 校验%.0f + 写盘%.0f",
@@ -385,19 +396,34 @@ class FileReceiver: ObservableObject {
      * 全是数组引用的持有，没有深拷贝。
      */
     private func persist(_ session: ReceiveSession) {
-        let snap = ProgressStore.snapshot(session)
         let url = ProgressStore.fileURL(for: session.sessionId)
         session.lastSavedAt = Date()
-        ioQueue.async { [weak self] in
-            do {
-                let data = ProgressStore.encode([snap])
-                try ProgressStore.ensureDirectory()
-                try data.write(to: url, options: .atomic)
-            } catch {
-                let msg = error.localizedDescription
-                Task { @MainActor in self?.addLog("进度保存失败：\(msg)", isError: true) }
+        /* 快照在 workQueue 上取（解码器归它管），编码与写盘在 ioQueue 上，
+           主 actor 从头到尾不参与 */
+        session.snapshotForSave { [weak self] solved, pending in
+            Task { @MainActor in
+                guard let self else { return }
+                let snap = ProgressStore.snapshot(session, solved: solved, pending: pending)
+                self.ioQueue.async {
+                    do {
+                        let data = ProgressStore.encode([snap])
+                        try ProgressStore.ensureDirectory()
+                        try data.write(to: url, options: .atomic)
+                    } catch {
+                        let msg = error.localizedDescription
+                        Task { @MainActor in self.addLog("进度保存失败：\(msg)", isError: true) }
+                    }
+                }
             }
         }
+    }
+
+    /*
+     * 等所有在途的消元回调落地。仅供测试——真实路径不需要等，等就等于把界面
+     * 重新绑回解码速度，而这次改动的全部意义就是解开这条绑定。
+     */
+    func drainForTests() async {
+        while pendingIngests > 0 { await Task.yield() }
     }
 
     /// App 进入后台时全量保存
@@ -406,7 +432,7 @@ class FileReceiver: ObservableObject {
         var saved = 0
         // 已合并落盘的会话没有中间态可存，其进度文件在落盘时已删除；
         // 收齐但尚未合并的仍必须保存，否则退出即丢
-        for session in sessions.values where !session.isFinished && !session.decoder.isReleased {
+        for session in sessions.values where !session.isFinished && !session.isReleased {
             if force || Date().timeIntervalSince(session.lastSavedAt) > autoSaveInterval {
                 persist(session)
                 saved += 1

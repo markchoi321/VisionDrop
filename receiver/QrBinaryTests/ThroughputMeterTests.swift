@@ -9,6 +9,12 @@ import Testing
 import Foundation
 @testable import QrBinary
 
+/*
+ * 串行执行。这一组用例共用 Documents/progress 与 received 两个目录，clearAll
+ * 会把它们整个删掉；并行跑时一个用例的清理会踩到另一个用例正在写的进度文件。
+ * 消元改成异步之后这个窗口被拉长，失败从偶发变成常态——根因一直在，不是新引入的。
+ */
+@Suite(.serialized)
 @MainActor
 struct ThroughputMeterTests {
 
@@ -89,7 +95,8 @@ struct ThroughputMeterTests {
 
     /// 速率必须只计去重后的新块：采样混叠模型要求每个二维码被扫到 2.5 次以上，
     /// 把重复帧算进去会让读数虚高一倍以上，无法用来比较档位与间隔
-    @Test func duplicateBlocksAreNotCounted() throws {
+    @MainActor
+    @Test func duplicateBlocksAreNotCounted() async throws {
         let stream = try Vectors.binary("stream.bin")
         let e2e = try Vectors.keyValues("e2e.txt")
         let T = Int(e2e["rlnc.T"]!)!, K = Int(e2e["rlnc.K"]!)!
@@ -103,9 +110,11 @@ struct ThroughputMeterTests {
         let receiver = FileReceiver()
         receiver.clearAll()
         _ = receiver.processPayload(Data(bytes))
+        await receiver.drainForTests()
         let after1 = receiver.throughput.bytesPerSecond()
         // 同一帧重复投递，blockId 相同，应全部被去重，速率不再增长
         for _ in 0..<4 { _ = receiver.processPayload(Data(bytes)) }
+        await receiver.drainForTests()
         let after5 = receiver.throughput.bytesPerSecond()
         #expect(after1 > 0)
         #expect(after5 == after1, "重复帧不得计入速率")

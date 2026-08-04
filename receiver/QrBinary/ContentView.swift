@@ -347,7 +347,7 @@ struct SessionProgressSection: View {
                         .foregroundStyle(.secondary)
 
                     // 次要指标：源块解出比例
-                    Text("源块 \(session.decoder.solvedCount)/\(session.K)（\(Int(session.sourceProgress * 100))%）")
+                    Text("源块 \(session.solvedCount)/\(session.K)（\(Int(session.sourceProgress * 100))%）")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }

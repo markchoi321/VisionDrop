@@ -392,7 +392,7 @@ struct EndToEndTests {
             state = Prng.xorshift32(state)
             let lost = (Double(state) / 4_294_967_296.0) < dropRate
             if !lost, let frame = FrameParser.parse(bytes) {
-                _ = session.ingest(frame)
+                session.ingestSyncForTests(frame)
             }
             base = base &+ UInt32(m)
             if frames > K * 20 { break }
@@ -453,10 +453,10 @@ struct ProgressStoreTests {
         while session.stats.blocksUnique < K / 2 {
             let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: codec, compressed: false,
                                                 sessionId: sid, baseBlockId: base, m: m, composer: composer)
-            _ = session.ingest(try #require(FrameParser.parse(bytes)))
+            session.ingestSyncForTests(try #require(FrameParser.parse(bytes)))
             base = base &+ UInt32(m)
         }
-        let solvedBefore = session.decoder.solvedCount
+        let solvedBefore = session.withDecoderSync { $0.solvedCount }
         let uniqueBefore = session.stats.blocksUnique
 
         let data = ProgressStore.encode([session])
@@ -466,17 +466,17 @@ struct ProgressStoreTests {
         #expect(restored.K == K)
         #expect(restored.T == T)
         #expect(restored.codec == codec)
-        #expect(restored.decoder.solvedCount == solvedBefore, "恢复后解码状态必须一致")
+        #expect(restored.solvedCount == solvedBefore, "恢复后解码状态必须一致")
         #expect(restored.stats.blocksUnique == uniqueBefore)
 
         // 继续喂到完成
         while !restored.isComplete {
             let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: codec, compressed: false,
                                                 sessionId: sid, baseBlockId: base, m: m, composer: composer)
-            _ = restored.ingest(try #require(FrameParser.parse(bytes)))
+            restored.ingestSyncForTests(try #require(FrameParser.parse(bytes)))
             base = base &+ UInt32(m)
         }
-        let result = try restored.finalizeContent()
+        let result = try restored.withDecoderSync { _ in try? restored.finalizeContent() }!
         #expect(result.content == fixture)
         TestReport.log("\(codec.displayName) .vdpg 往返：\(data.count) 字节，恢复后源块 \(solvedBefore)/\(K)，续解完成")
     }
@@ -503,8 +503,10 @@ struct ProgressStoreTests {
         let src = TestEncoder.splitSourceBlocks(content, K: K, T: T)
         /* 灌到基本填满，此时消元基最稠密、编码体积最大 */
         for bid in 0..<UInt32(K) {
-            _ = session.decoder.add(blockId: bid,
-                                    payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T))
+            _ = session.withDecoderSync {
+                $0.add(blockId: bid,
+                       payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T))
+            }
         }
         let size = ProgressStore.encode([session]).count
         /* 位图上界：每行 = 4 blockId + 1 标签 + 3 位数 + ceil(K/64)*8 + T */
@@ -529,14 +531,14 @@ struct ProgressStoreTests {
         let session = ReceiveSession(sessionId: sid, K: K, T: T, codec: .peeling, compressed: false)
         let bytes = TestEncoder.encodeFrame(src: src, K: K, T: T, codec: .peeling, compressed: false,
                                             sessionId: sid, baseBlockId: 0, m: m, composer: composer)
-        _ = session.ingest(try #require(FrameParser.parse(bytes)))
+        session.ingestSyncForTests(try #require(FrameParser.parse(bytes)))
 
         try ProgressStore.save(session)
         let url = ProgressStore.fileURL(for: sid)
         #expect(FileManager.default.fileExists(atPath: url.path))
 
         let reloaded = try #require(try ProgressStore.decode(try Data(contentsOf: url)).first)
-        #expect(reloaded.decoder.solvedCount == session.decoder.solvedCount)
+        #expect(reloaded.solvedCount == session.withDecoderSync({ $0.solvedCount }))
 
         ProgressStore.remove(sessionId: sid)
         #expect(!FileManager.default.fileExists(atPath: url.path))

@@ -40,8 +40,57 @@ final class ReceiveSession: Identifiable {
     let codec: Codec
     let compressed: Bool
 
-    // 解码状态
-    let decoder: BlockDecoder
+    /*
+     * 解码状态。
+     *
+     * **decoder 只允许在 workQueue 上访问。** 喷泉码的消元代价随秩线性增长
+     * （K=2629、T=460 时秩 2000 处单块 Release 0.03 ms、Debug 9.4 ms），而一帧
+     * 携带十来个块、帧以 20 fps 到达；放在主 actor 上，传输后半程必然把界面
+     * 按死——进度读数和「完成」按钮一起卡住。这与快慢无关，是归属问题：
+     * 界面响应和块消元是两件不相干的事，不该互相阻塞。
+     *
+     * 主 actor 要读的量走下面的镜像，由 workQueue 写、加锁保护。
+     */
+    private let decoder: BlockDecoder
+    /*
+     * 每个会话一条串行队列。正确性只要求「同一个会话的解码器不被并发访问」，
+     * 共用一条全局队列会让互不相干的会话互相排队——两个会话同时在收时，
+     * 一方的消元会把另一方按住；并行跑的测试之间也会互相干扰。
+     */
+    let workQueue: DispatchQueue
+
+    private let mirrorLock = NSLock()
+    private var _solved = 0
+    private var _complete = false
+    private var _released = false
+
+    private func syncMirror() {          // 仅在 workQueue 上调用
+        mirrorLock.lock()
+        _solved = decoder.solvedCount
+        _complete = decoder.isComplete
+        _released = decoder.isReleased
+        mirrorLock.unlock()
+    }
+
+    /// 在 workQueue 上访问解码器。调用方负责不把结果里的引用带回主 actor。
+    func onWorkQueue<R>(_ body: @escaping (BlockDecoder) -> R,
+                        then done: @escaping @MainActor (R) -> Void) {
+        workQueue.async { [self] in
+            let r = body(decoder)
+            syncMirror()
+            Task { @MainActor in done(r) }
+        }
+    }
+
+    /// 同步版本，仅供启动时的恢复与测试使用（此时没有并发）
+    @discardableResult
+    func withDecoderSync<R>(_ body: (BlockDecoder) -> R) -> R {
+        workQueue.sync {
+            let r = body(decoder)
+            syncMirror()
+            return r
+        }
+    }
 
     // 元数据与统计
     var meta: StreamMeta?
@@ -58,6 +107,8 @@ final class ReceiveSession: Identifiable {
     var finalizeProgress: Double = 0
     /// 用户请求中止合并。后台线程轮询，故用带锁的标志而非裸 Bool
     var finalizeCancel: CancellationFlag?
+    /// 「已收齐」只报一次。消元回调是异步的，收齐之后还会有若干帧的回调陆续到达
+    var completionAnnounced = false
     /// 最终文件字节数。解码状态释放后由它提供展示数据
     var finalSize: Int?
 
@@ -76,6 +127,8 @@ final class ReceiveSession: Identifiable {
         self.codec = codec
         self.compressed = compressed
         self.stats = stats
+        self.workQueue = DispatchQueue(label: "vd.blocks.\(SessionId.hex(sessionId))",
+                                       qos: .userInitiated)
         switch codec {
         case .linearSolve: self.decoder = LinearSolveDecoder(K: K, T: T)
         case .peeling: self.decoder = PeelingDecoder(K: K, T: T)
@@ -90,9 +143,12 @@ final class ReceiveSession: Identifiable {
 
     // MARK: - 进度
 
-    var isComplete: Bool { decoder.isComplete }
+    /* 以下三个读的是镜像，不碰解码器，主 actor 上随便读 */
+    var isComplete: Bool { mirrorLock.lock(); defer { mirrorLock.unlock() }; return _complete }
+    var isReleased: Bool { mirrorLock.lock(); defer { mirrorLock.unlock() }; return _released }
+    var solvedCount: Int { mirrorLock.lock(); defer { mirrorLock.unlock() }; return _solved }
     /// 次要指标：已解出源块（解方程方案为消元秩）占 K 的比例
-    var sourceProgress: Double { K > 0 ? Double(decoder.solvedCount) / Double(K) : 0 }
+    var sourceProgress: Double { K > 0 ? Double(solvedCount) / Double(K) : 0 }
 
     /// ε：解方程 2/K，剥洋葱 1.85/K^0.37，K ≤ 1 时取 0（CONTRACT 第 5 节）
     var epsilon: Double {
@@ -118,25 +174,80 @@ final class ReceiveSession: Identifiable {
 
     // MARK: - 帧接收
 
-    /// 吃下一帧的全部编码块，返回是否有新块被接受
-    func ingest(_ frame: ParsedFrame) -> Bool {
+    /// 一帧消化完的结果。全是值类型，可以安全地从 workQueue 带回主 actor。
+    struct IngestResult: Sendable {
+        var gained = false
+        var received = 0
+        var duplicate = 0
+        var maxBlockId: UInt32 = 0
+        /// 剥洋葱方案可能在这一帧解出文件头
+        var meta: StreamMeta?
+        var complete = false
+    }
+
+    /*
+     * 吃下一帧的全部编码块。消元在 workQueue 上做，结果回主 actor 由调用方
+     * 合并进 stats——统计量归主 actor 管，解码器归 workQueue 管，两边不共享
+     * 可变状态。帧序无所谓（喷泉码本来就与顺序无关），串行队列保证的是
+     * 同一会话不会有两次 add 并发。
+     */
+    func ingest(_ frame: ParsedFrame, completion: @escaping @MainActor (IngestResult) -> Void) {
         blocksPerFrame = frame.m
         stats.framesAccepted += 1
         stats.lastSeenAt = Date()
 
-        var gained = false
-        for i in 0..<frame.m {
-            let bid = frame.blockId(i)
-            stats.blocksReceived += 1
-            if bid > stats.maxBlockId { stats.maxBlockId = bid }
-            if decoder.add(blockId: bid, payload: frame.block(i)) {
-                gained = true
-            } else {
-                stats.blocksDuplicate += 1
+        let m = frame.m
+        let ids = (0..<m).map { frame.blockId($0) }
+        let blocks = (0..<m).map { Array(frame.block($0)) }
+        let wantMeta = (meta == nil)
+
+        workQueue.async { [self] in
+            var r = IngestResult()
+            for i in 0..<m {
+                r.received += 1
+                if ids[i] > r.maxBlockId { r.maxBlockId = ids[i] }
+                if decoder.add(blockId: ids[i], payload: blocks[i]) {
+                    r.gained = true
+                } else {
+                    r.duplicate += 1
+                }
             }
+            if r.gained && wantMeta { r.meta = extractMetaOnWorkQueue() }
+            syncMirror()
+            r.complete = decoder.isComplete
+            Task { @MainActor in completion(r) }
         }
-        if gained { tryExtractMeta() }
-        return gained
+    }
+
+    /*
+     * 同步版本，仅供测试。真实路径一律走上面的异步版——测试要的是确定性，
+     * 为它引入等待反而会让用例变脆。
+     */
+    func ingestSyncForTests(_ frame: ParsedFrame) {
+        blocksPerFrame = frame.m
+        stats.framesAccepted += 1
+        stats.lastSeenAt = Date()
+        var r = IngestResult()
+        let wantMeta = (meta == nil)
+        withDecoderSync { d in
+            for i in 0..<frame.m {
+                let bid = frame.blockId(i)
+                r.received += 1
+                if bid > r.maxBlockId { r.maxBlockId = bid }
+                if d.add(blockId: bid, payload: frame.block(i)) { r.gained = true }
+                else { r.duplicate += 1 }
+            }
+            if r.gained && wantMeta { r.meta = extractMetaOnWorkQueue() }
+        }
+        apply(r)
+    }
+
+    /// 把 IngestResult 并回统计量。仅主 actor 调用。
+    func apply(_ r: IngestResult) {
+        stats.blocksReceived += r.received
+        stats.blocksDuplicate += r.duplicate
+        if r.maxBlockId > stats.maxBlockId { stats.maxBlockId = r.maxBlockId }
+        if let m = r.meta, meta == nil { meta = m }
     }
 
     /*
@@ -152,9 +263,14 @@ final class ReceiveSession: Identifiable {
      * 收齐后不自动合并本来就是既定取舍（合并时长不可预测，交给用户触发），
      * 为了早几秒显示一个文件名而在主线程上跑一次完整回代，方向就错了。
      */
+    /// 走 workQueue 取一次文件头。仅在没有并发时使用（恢复进度后、测试）。
     func tryExtractMeta() {
         guard meta == nil else { return }
-        guard let peeling = decoder as? PeelingDecoder else { return }
+        meta = withDecoderSync { _ in extractMetaOnWorkQueue() }
+    }
+
+    private func extractMetaOnWorkQueue() -> StreamMeta? {
+        guard let peeling = decoder as? PeelingDecoder else { return nil }
         var buf = [UInt8]()
         var i = 0
         // 连续块凑够 54 + fileNameLen 即可解析出头部
@@ -162,17 +278,42 @@ final class ReceiveSession: Identifiable {
             buf.append(contentsOf: blk)
             i += 1
             if buf.count >= StreamCodec.headerFixedLength {
-                if let m = try? StreamCodec.parseHeader(buf) {
-                    meta = m
-                    return
-                }
+                if let m = try? StreamCodec.parseHeader(buf) { return m }
             }
         }
+        return nil
     }
 
     // MARK: - 完成
 
-    /// 拼接源块 -> parseStream -> 解压 -> 校验 SHA-256
+    /// 回代。必须在 workQueue 上调用（completeSession 已经把整段放在那条队列上）。
+    func assembleOnWorkQueue(progress: ((Double) -> Void)?,
+                             isCancelled: () -> Bool) -> [UInt8]? {
+        decoder.assemble(progress: progress, isCancelled: isCancelled)
+    }
+
+    /// 释放中间态。走 workQueue 保证不与消元并发。
+    func releaseStorage() {
+        workQueue.async { [self] in
+            decoder.releaseStorage()
+            syncMirror()
+        }
+    }
+
+    /// 恢复进度文件。仅启动时调用，此时尚无并发。
+    @discardableResult
+    func restoreProgress(solved: [SolvedRecord], pending: [PendingRecord]) -> Int {
+        withDecoderSync { $0.restore(solved: solved, pending: pending) }
+    }
+
+    /// 取进度快照。在 workQueue 上执行，结果交回调用方。
+    func snapshotForSave(_ done: @escaping @Sendable ([SolvedRecord], [PendingRecord]) -> Void) {
+        workQueue.async { [self] in
+            done(decoder.snapshotSolved(), decoder.snapshotPending())
+        }
+    }
+
+    /// 拼接源块 -> parseStream -> 解压 -> 校验 SHA-256。必须在 workQueue 上调用。
     func finalizeContent() throws -> (meta: StreamMeta, content: [UInt8]) {
         let assembled = decoder.assemble()
         let parsed = try StreamCodec.parseStream(assembled)

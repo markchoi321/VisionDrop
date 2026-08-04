@@ -105,8 +105,17 @@
                 [N - 1 - CORNER, 1], [N - 1 - CORNER, N - 1 - CAL_LEN]];
     }
 
-    /* 自由格行优先列表，元素为 r*N+c */
+    /*
+     * 自由格行优先列表，元素为 r*N+c。
+     *
+     * 按 N 缓存。这个表只由 N 决定，与载荷无关，但 encode() 每帧要用两次
+     * （capacity 里一次、排布数据时一次）。N=128 时它要扫 16384 格再 push
+     * 出一万五千个下标，每帧重算两遍在 60 fps 下是纯浪费。
+     * 返回的是共享只读对象，调用方不得修改。
+     */
+    var FREE_CACHE = {};
     function freeCells(N) {
+        if (FREE_CACHE[N]) { return FREE_CACHE[N]; }
         var fn = new Uint8Array(N * N);
         var r, c, i;
         for (r = 0; r < N; r++) {
@@ -124,15 +133,19 @@
                 fn[strips[i][0] * N + strips[i][1] + c] = 1;
             }
         }
-        var out = [];
-        for (i = 0; i < N * N; i++) {
-            if (!fn[i]) { out.push(i); }
-        }
+        var cnt = 0;
+        for (i = 0; i < N * N; i++) { if (!fn[i]) { cnt++; } }
+        var out = new Int32Array(cnt);
+        var p = 0;
+        for (i = 0; i < N * N; i++) { if (!fn[i]) { out[p++] = i; } }
+        FREE_CACHE[N] = out;
         return out;
     }
 
-    /* 返回 {free, dataCells, capBytes, net} */
+    /* 返回 {free, dataCells, capBytes, net}，按 N 缓存，共享只读 */
+    var CAP_CACHE = {};
     function capacity(N) {
+        if (CAP_CACHE[N]) { return CAP_CACHE[N]; }
         var free = freeCells(N).length;
         var dataCells = free - HEADER_CELLS;
         var capBytes = Math.floor(dataCells * 3 / 8);
@@ -143,7 +156,9 @@
                 break;
             }
         }
-        return { free: free, dataCells: dataCells, capBytes: capBytes, net: net };
+        var r = { free: free, dataCells: dataCells, capBytes: capBytes, net: net };
+        CAP_CACHE[N] = r;
+        return r;
     }
 
     /* ------------------------------------------------ 头部 */
@@ -204,13 +219,13 @@
     var RING = ["1111111", "1000001", "1011101", "1011101",
                 "1011101", "1000001", "1111111"];
 
-    /* payload(Uint8Array) -> {n: N, cells: Uint8Array(N*N)，值 0-7} */
-    function encode(payload, N) {
-        var cap = capacity(N);
-        if (payload.length > cap.net) {
-            throw new Error("载荷超出容量: N=" + N + " len=" + payload.length +
-                " net=" + cap.net);
-        }
+    /*
+     * 固定结构模板：白底 + 定位图形 + 边框环 + 定标条。这些格子只由 N 决定，
+     * 逐帧重画一遍毫无意义，缓存下来每帧拷贝一份即可。
+     */
+    var TPL_CACHE = {};
+    function staticTemplate(N) {
+        if (TPL_CACHE[N]) { return TPL_CACHE[N]; }
         var cells = new Uint8Array(N * N);
         var i, r, c, dr, dc;
         for (i = 0; i < N * N; i++) { cells[i] = 7; }      /* 默认白 */
@@ -248,6 +263,20 @@
                 cells[strips[i][0] * N + strips[i][1] + c] = c;
             }
         }
+        TPL_CACHE[N] = cells;
+        return cells;
+    }
+
+    /* payload(Uint8Array) -> {n: N, cells: Uint8Array(N*N)，值 0-7} */
+    function encode(payload, N) {
+        var cap = capacity(N);
+        if (payload.length > cap.net) {
+            throw new Error("载荷超出容量: N=" + N + " len=" + payload.length +
+                " net=" + cap.net);
+        }
+        var cells = new Uint8Array(staticTemplate(N));    /* 固定结构一次拷贝到位 */
+        var i;
+
         /* 头部：40 bit x 3 副本，白=0 黑=1 */
         var free = freeCells(N);
         var head = buildHeader(payload.length);

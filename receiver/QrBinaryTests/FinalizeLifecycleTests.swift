@@ -26,35 +26,38 @@ struct FinalizeLifecycleTests {
         let src = TestEncoder.splitSourceBlocks(stream, K: K, T: T)
         let session = ReceiveSession(sessionId: 0xABCD, K: K, T: T, codec: codec, compressed: false)
         var bid: UInt32 = 0
-        while !session.decoder.isComplete && bid < UInt32(K * 6) {
-            _ = session.decoder.add(blockId: bid,
-                                    payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T)[...])
+        while !session.withDecoderSync({ $0.isComplete }) && bid < UInt32(K * 6) {
+            _ = session.withDecoderSync {
+                $0.add(blockId: bid,
+                       payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T)[...])
+            }
             bid &+= 1
         }
-        #expect(session.decoder.isComplete)
+        #expect(session.withDecoderSync({ $0.isComplete }))
         return (session, content)
     }
 
     @Test(arguments: [Codec.linearSolve, Codec.peeling])
     func releaseKeepsCompletionSemantics(codec: Codec) throws {
         let (session, content) = try completedSession(codec: codec, T: 293, contentSize: 40_000)
-        let assembled = try #require(session.decoder.assemble(progress: nil, isCancelled: { false }))
+        let assembled = try #require(session.withDecoderSync {
+            $0.assemble(progress: nil, isCancelled: { false }) })
         let parsed = try StreamCodec.parseStream(assembled)
         #expect(parsed.content == content)
 
         let K = session.K
-        session.decoder.releaseStorage()
+        session.withDecoderSync { $0.releaseStorage() }
 
         // 释放后仍要表现为「已完成」，否则界面会把它当成半截会话重新开始收
-        #expect(session.decoder.isReleased)
-        #expect(session.decoder.isComplete)
+        #expect(session.withDecoderSync({ $0.isReleased }))
+        #expect(session.withDecoderSync({ $0.isComplete }))
         #expect(session.isComplete)
-        #expect(session.decoder.solvedCount == K)
-        #expect(session.decoder.pendingCount == 0)
+        #expect(session.withDecoderSync({ $0.solvedCount }) == K)
+        #expect(session.withDecoderSync({ $0.pendingCount }) == 0)
         // 中间态必须真的没了
-        #expect(session.decoder.snapshotSolved().isEmpty)
-        #expect(session.decoder.snapshotPending().isEmpty)
-        if let peeling = session.decoder as? PeelingDecoder {
+        #expect(session.withDecoderSync({ $0.snapshotSolved() }).isEmpty)
+        #expect(session.withDecoderSync({ $0.snapshotPending() }).isEmpty)
+        if let peeling = session.withDecoderSync({ $0 as? PeelingDecoder }) {
             #expect(peeling.solvedBlock(0) == nil, "释放后读源块不得越界")
         }
     }
@@ -62,7 +65,7 @@ struct FinalizeLifecycleTests {
     /// 释放后 tryExtractMeta 不得崩溃（它会去读源块）
     @Test func metaExtractionSafeAfterRelease() throws {
         let (session, _) = try completedSession(codec: .peeling, T: 293, contentSize: 40_000)
-        session.decoder.releaseStorage()
+        session.withDecoderSync { $0.releaseStorage() }
         session.meta = nil
         session.tryExtractMeta()      // 不崩即可
         #expect(session.meta == nil)
@@ -73,7 +76,7 @@ struct FinalizeLifecycleTests {
         let (session, _) = try completedSession(codec: .linearSolve, T: 419, contentSize: 200_000)
         let flag = CancellationFlag()
         flag.set()
-        let out = session.decoder.assemble(progress: nil, isCancelled: { flag.isSet })
+        let out = session.withDecoderSync { $0.assemble(progress: nil, isCancelled: { flag.isSet }) }
         #expect(out == nil, "已置位取消标志时必须返回 nil")
     }
 
@@ -91,10 +94,12 @@ struct FinalizeLifecycleTests {
         let (session, _) = try completedSession(codec: codec, T: 293, contentSize: 60_000)
         final class Box: @unchecked Sendable { var last = -1.0; var count = 0 }
         let box = Box()
-        let out = session.decoder.assemble(progress: { p in
-            box.last = p
-            box.count += 1
-        }, isCancelled: { false })
+        let out = session.withDecoderSync { d in
+            d.assemble(progress: { p in
+                box.last = p
+                box.count += 1
+            }, isCancelled: { false })
+        }
         #expect(out != nil)
         #expect(box.count > 0, "至少要回调一次")
         #expect(box.last == 1.0, "结束时进度必须是 1.0")
@@ -130,7 +135,7 @@ struct ManualFinalizeTests {
         #expect(session.isComplete, "块应已收齐")
         #expect(!session.isFinalizing, "不得自动开始合并")
         #expect(!session.isFinished, "不得自动落盘")
-        #expect(!session.decoder.isReleased, "未合并前中间态必须保留")
+        #expect(!session.withDecoderSync({ $0.isReleased }), "未合并前中间态必须保留")
     }
 
     /// 收齐但未合并的会话必须能被保存，否则退出即丢
@@ -142,14 +147,16 @@ struct ManualFinalizeTests {
         let composer = PeelingComposer(K: K)
         let session = ReceiveSession(sessionId: 0x5150, K: K, T: T, codec: .peeling, compressed: false)
         var bid: UInt32 = 0
-        while !session.decoder.isComplete && bid < UInt32(K * 6) {
-            _ = session.decoder.add(blockId: bid,
-                                    payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T)[...])
+        while !session.withDecoderSync({ $0.isComplete }) && bid < UInt32(K * 6) {
+            _ = session.withDecoderSync {
+                $0.add(blockId: bid,
+                       payload: TestEncoder.xorBlocks(src, composer.neighborsOf(bid), T)[...])
+            }
             bid &+= 1
         }
         #expect(session.isComplete && !session.isFinished)
         // 快照必须仍然拿得到全部源块
-        #expect(session.decoder.snapshotSolved().count == K)
+        #expect(session.withDecoderSync({ $0.snapshotSolved() }).count == K)
         let blob = ProgressStore.encode([session])
         #expect(blob.count > K * T, "序列化必须包含全部源块")
     }
@@ -157,6 +164,12 @@ struct ManualFinalizeTests {
 
 // MARK: - 清理
 
+/*
+ * 串行执行。这一组用例共用 Documents/progress 与 received 两个目录，clearAll
+ * 会把它们整个删掉；并行跑时一个用例的清理会踩到另一个用例正在写的进度文件。
+ * 消元改成异步之后这个窗口被拉长，失败从偶发变成常态——根因一直在，不是新引入的。
+ */
+@Suite(.serialized)
 @MainActor
 struct ClearAllTests {
 
@@ -233,10 +246,12 @@ struct ClearAllTests {
     /// 读数一律传入 seed 之前的时刻：计量窗口只有 1 秒，而测试是并行跑的，
     /// 机器负载高时 seedSession 到断言之间真能超过 1 秒，样本被窗口淘汰、
     /// 首个断言假失败。这里要验的是 clearAll 的行为，不是墙钟。
-    @Test func clearAllResetsThroughput() throws {
+    @MainActor
+    @Test func clearAllResetsThroughput() async throws {
         let receiver = FileReceiver()
         let t0 = CACurrentMediaTime()
         _ = try seedSession(receiver)
+        await receiver.drainForTests()
         #expect(receiver.throughput.bytesPerSecond(now: t0) > 0)
         receiver.clearAll()
         #expect(receiver.throughput.bytesPerSecond(now: t0) == 0)

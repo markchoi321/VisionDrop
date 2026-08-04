@@ -50,7 +50,8 @@ button { cursor: pointer; margin-right: 6px; }
         <label for="tier">档位</label>
         <select id="tier"></select>
         <label for="interval">间隔(ms)</label>
-        <input type="number" id="interval" value="150" min="30" step="10" style="width:70px">
+        <input type="number" id="interval" value="150" min="16" step="1" style="width:70px">
+        <span class="hint">会自动量化成刷新周期的整数倍；填 16 即每个刷新周期换一帧</span>
     </div>
     <div class="row">
         <button id="btn_play">开始播放</button>
@@ -84,7 +85,6 @@ button { cursor: pointer; margin-right: 6px; }
     var nextBlockId = 0;      /* 游标：仅在帧真正显示后推进 */
     var framesShown = 0;
     var playing = false;
-    var timer = null;
     var canvas = document.getElementById("symcanvas");
     var ctx = canvas.getContext("2d");
 
@@ -100,7 +100,7 @@ button { cursor: pointer; margin-right: 6px; }
             var st = JSON.parse(raw);
             nextBlockId = st.nextBlockId % 4294967296 || 0;
             framesShown = st.framesShown || 0;
-            if (st.intervalMs >= 30) { $("interval").value = st.intervalMs; }
+            if (st.intervalMs >= 16) { $("interval").value = st.intervalMs; }
         } catch (e) { /* localStorage 不可用时静默跳过 */ }
     }
 
@@ -181,10 +181,22 @@ button { cursor: pointer; margin-right: 6px; }
     }
 
     function refreshStats() {
+        /* stop() 也会调它，而选文件的第一步就是 stop()，此时还没有会话 */
+        if (!sess || !tiers.length) { return; }
+        var h = currentHold();
+        var fps = 0;
+        if (presentTs.length >= 2) {
+            fps = 1000 * (presentTs.length - 1) /
+                  (presentTs[presentTs.length - 1] - presentTs[0]);
+        }
         $("stats").innerHTML = "已播帧数 " + framesShown +
             " ｜ 下一块序号 " + nextBlockId +
             " ｜ 当前档一轮约需 " + currentPassFrames() + " 帧" +
-            " ｜ 间隔 " + (parseInt($("interval").value, 10) || 150) + " ms";
+            " ｜ 显示间隔 " + h.hold.toFixed(1) + " ms（" + h.k + " × " +
+            h.P.toFixed(1) + " ms 刷新周期）" +
+            (fps > 0 ? " ｜ 实测 " + fps.toFixed(1) + " fps" : "") +
+            (starved > 0 ? " ｜ <span class=\"warn\">欠载保帧 " + starved +
+                           " 次（间隔太激进或档位太重）</span>" : "");
     }
 
     function fillTierSelect() {
@@ -203,52 +215,211 @@ button { cursor: pointer; margin-right: 6px; }
     }
 
     var MARGIN = VDD.QUIET;   /* 静区 2 格 */
+    var RING_CAP = 3;         /* 预渲染深度 */
 
-    function drawFrame() {
-        var t = tiers[tierIdx];
-        var frame = sess.encodeFrame(nextBlockId, t.m);
-        var sym = VDD.encode(frame, t.N);
-        var n = sym.n;
+    /*
+     * 8 色调色板的 RGBA32 查找表。
+     *
+     * 原先逐格 fillRect：N=128 时是 16384 次绘制调用，外加 16384 次 CSS 颜色
+     * 字符串解析，光这一项就塞不进一个 16.7 ms 的刷新周期。改成往 ImageData
+     * 里写 uint32、一次 putImageData 提交。按字节写 RGBA、按 uint32 读回，
+     * 字节序自动适配，不必判断大小端。
+     */
+    var PAL32 = (function () {
+        var buf = new ArrayBuffer(4);
+        var u8 = new Uint8Array(buf), u32 = new Uint32Array(buf);
+        var lut = new Uint32Array(8);
+        for (var v = 0; v < 8; v++) {
+            u8[0] = (v & 4) ? 255 : 0;    /* bit2 = R */
+            u8[1] = (v & 2) ? 255 : 0;    /* bit1 = G */
+            u8[2] = (v & 1) ? 255 : 0;    /* bit0 = B */
+            u8[3] = 255;
+            lut[v] = u32[0];
+        }
+        return lut;
+    })();
+
+    var now = (window.performance && window.performance.now)
+        ? function () { return window.performance.now(); }
+        : function () { return new Date().getTime(); };
+
+    var raf = window.requestAnimationFrame || window.webkitRequestAnimationFrame;
+    var caf = window.cancelAnimationFrame || window.webkitCancelAnimationFrame;
+    if (!raf) {
+        raf = function (fn) { return window.setTimeout(function () { fn(now()); }, 16); };
+        caf = function (id) { window.clearTimeout(id); };
+    }
+
+    /* ---------------------------------------------- 预渲染流水线 */
+
+    var geo = null;           /* {n, dim, px, size}，仅换档/改窗口时重算 */
+    var slots = [];           /* 环形缓冲，元素是 1 px/格 的离屏画布 */
+    var qHead = 0, qTail = 0, qCount = 0;
+    var encodeBlockId = 0;    /* 预渲染游标，跑在显示游标 nextBlockId 前面 */
+
+    function computeGeom() {
+        var n = tiers[tierIdx].N;
+        var dim = n + MARGIN * 2;
         var avail = Math.min(
             (window.innerWidth || document.documentElement.clientWidth) - 40,
             (window.innerHeight || document.documentElement.clientHeight) - 60);
         if (avail < 100) { avail = 100; }
-        var px = Math.floor(avail / (n + MARGIN * 2));
+        var px = Math.floor(avail / dim);
         if (px < 1) { px = 1; }
-        var size = (n + MARGIN * 2) * px;
-        canvas.width = size;
-        canvas.height = size;
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(0, 0, size, size);
-        for (var r = 0; r < n; r++) {
-            for (var c = 0; c < n; c++) {
-                var v = sym.cells[r * n + c];
-                if (v !== 7) {
-                    ctx.fillStyle = VDD.PALETTE_CSS[v];
-                    ctx.fillRect((c + MARGIN) * px, (r + MARGIN) * px, px, px);
-                }
-            }
+        return { n: n, dim: dim, px: px, size: dim * px };
+    }
+
+    function makeSlot(dim) {
+        var cv = document.createElement("canvas");
+        cv.width = dim;
+        cv.height = dim;
+        var c2 = cv.getContext("2d");
+        var img = c2.createImageData(dim, dim);
+        var u32 = new Uint32Array(img.data.buffer);
+        /* 静区恒为白，只在这里刷一次，逐帧只重写内部 n×n */
+        for (var i = 0; i < u32.length; i++) { u32[i] = PAL32[7]; }
+        return { cv: cv, ctx: c2, img: img, u32: u32, dim: dim, blockIdAfter: 0 };
+    }
+
+    /*
+     * 重建流水线。画布尺寸只在这里改——原先每帧都写 canvas.width，那会清空
+     * 后备存储并可能触发一次 layout，换帧瞬间合成器有机会拿到空白或旧内容。
+     */
+    function rebuildPipeline() {
+        geo = computeGeom();
+        if (canvas.width !== geo.size) {
+            canvas.width = geo.size;
+            canvas.height = geo.size;
         }
-        nextBlockId = (nextBlockId + t.m) % 4294967296;
+        /* 改尺寸会重置 2D 上下文状态，插值开关必须跟着重设 */
+        ctx.imageSmoothingEnabled = false;
+        ctx.webkitImageSmoothingEnabled = false;
+        ctx.mozImageSmoothingEnabled = false;
+        ctx.msImageSmoothingEnabled = false;
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, geo.size, geo.size);
+
+        slots = [];
+        for (var i = 0; i < RING_CAP; i++) { slots.push(makeSlot(geo.dim)); }
+        qHead = 0; qTail = 0; qCount = 0;
+        encodeBlockId = nextBlockId;
+    }
+
+    /* 生产一帧进缓冲。返回 false 表示缓冲已满 */
+    function produceFrame() {
+        if (!geo || qCount >= RING_CAP) { return false; }
+        var t = tiers[tierIdx];
+        var frame = sess.encodeFrame(encodeBlockId, t.m);
+        var sym = VDD.encode(frame, t.N);
+        var slot = slots[qTail];
+        var cells = sym.cells, n = sym.n, dim = slot.dim, u32 = slot.u32;
+        for (var r = 0; r < n; r++) {
+            var src = r * n;
+            var dst = (r + MARGIN) * dim + MARGIN;
+            for (var c = 0; c < n; c++) { u32[dst + c] = PAL32[cells[src + c]]; }
+        }
+        slot.ctx.putImageData(slot.img, 0, 0);
+        encodeBlockId = (encodeBlockId + t.m) % 4294967296;
+        slot.blockIdAfter = encodeBlockId;
+        qTail = (qTail + 1) % RING_CAP;
+        qCount++;
+        return true;
+    }
+
+    /*
+     * 呈现一帧。换帧动作只剩一次 drawImage——离屏位图按整数倍最近邻放大，
+     * 是一次位块搬运。它跑在 rAF 回调里，浏览器在回调结束时统一提交，
+     * 屏幕上不会出现半张图。
+     */
+    function presentFrame() {
+        var slot = slots[qHead];
+        qHead = (qHead + 1) % RING_CAP;
+        qCount--;
+        ctx.drawImage(slot.cv, 0, 0, geo.size, geo.size);
+        nextBlockId = slot.blockIdAfter;   /* 游标仍然只在帧真正显示后推进 */
         framesShown++;
     }
 
-    function tick() {
+    /* ---------------------------------------------- vsync 对齐的调度 */
+
+    var rafId = null;
+    var lastRafTs = 0;
+    var vsyncP = 0;           /* 刷新周期估计 */
+    var rafDeltas = [];       /* 最近 2 秒的 rAF 间隔，取最小值作周期 */
+    var lastPresentTs = 0;
+    var starved = 0;          /* 缓冲欠载导致的保帧次数 */
+    var lastStatsTs = 0, lastSaveTs = 0;
+    var presentTs = [];       /* 最近若干次呈现时刻，用来报实测 fps */
+
+    /*
+     * 把用户填的间隔量化成刷新周期的整数倍。
+     *
+     * setTimeout 的间隔和刷新周期没有公约数，换帧点在刷新周期内随机漂移，
+     * 每帧的实际显示时长在 ±1 个刷新周期内跳动——接收端看到的稳定窗口是抖的。
+     * 对齐之后每帧显示时长恒定，"曝光落在稳定期"的概率才是可算的。
+     */
+    function currentHold() {
+        var P = vsyncP || 16.7;
+        var want = parseInt($("interval").value, 10) || 150;
+        var k = Math.round(want / P);
+        if (k < 1) { k = 1; }
+        return { P: P, k: k, hold: k * P };
+    }
+
+    function frameLoop(ts) {
         if (!playing) { return; }
-        var t0 = new Date().getTime();
+        rafId = raf(frameLoop);
+
+        /*
+         * 刷新周期估计：掉帧只会让 rAF 间隔变大、不会变小，所以近期最小值就是
+         * 真实周期。用滑动窗口而不是全程最小值——否则一次偶发的异常小间隔会把
+         * 估计永久钉死，显示器中途换刷新率（ProMotion 120→60）也跟不上。
+         */
+        if (lastRafTs > 0) {
+            var d = ts - lastRafTs;
+            if (d >= 4 && d <= 200) {
+                rafDeltas.push(d);
+                if (rafDeltas.length > 120) { rafDeltas.shift(); }
+                var mn = rafDeltas[0];
+                for (var i = 1; i < rafDeltas.length; i++) {
+                    if (rafDeltas[i] < mn) { mn = rafDeltas[i]; }
+                }
+                vsyncP = mn;
+            }
+        }
+        lastRafTs = ts;
+
+        var h = currentHold();
+        if (lastPresentTs === 0 || ts - lastPresentTs >= h.hold - h.P * 0.5) {
+            if (qCount > 0) {
+                presentFrame();
+                lastPresentTs = ts;
+                presentTs.push(ts);
+                if (presentTs.length > 30) { presentTs.shift(); }
+            } else {
+                /*
+                 * 缓冲空了。宁可让上一帧多显示一个周期（接收端按重复帧丢掉，
+                 * 只损失一点吞吐），也绝不呈现半成品——废帧就是这么来的。
+                 */
+                starved++;
+            }
+        }
+
+        /* 本帧剩下的时间拿去预渲染，预算取显示间隔的六成，给合成留余量 */
+        var budget = Math.max(4, h.hold * 0.6);
+        var t0 = now();
         try {
-            drawFrame();
+            while (qCount < RING_CAP && now() - t0 < budget) {
+                if (!produceFrame()) { break; }
+            }
         } catch (e) {
             stop();
             errEl.innerHTML = "编码出错: " + e.message;
             return;
         }
-        refreshStats();
-        if (framesShown % 20 === 0) { saveState(); }
-        var interval = parseInt($("interval").value, 10) || 150;
-        var wait = interval - (new Date().getTime() - t0);
-        if (wait < 0) { wait = 0; }
-        timer = window.setTimeout(tick, wait);
+
+        if (ts - lastStatsTs > 250) { refreshStats(); lastStatsTs = ts; }
+        if (ts - lastSaveTs > 2000) { saveState(); lastSaveTs = ts; }
     }
 
     function play() {
@@ -256,14 +427,27 @@ button { cursor: pointer; margin-right: 6px; }
         playing = true;
         $("btn_play").innerHTML = "暂停";
         $("qrwrap").style.display = "";
-        tick();
+        lastRafTs = 0; lastPresentTs = 0; vsyncP = 0; rafDeltas = [];
+        starved = 0; presentTs = [];
+        lastStatsTs = 0; lastSaveTs = 0;
+        try {
+            rebuildPipeline();
+            while (qCount < RING_CAP) { if (!produceFrame()) { break; } }
+        } catch (e) {
+            playing = false;
+            $("btn_play").innerHTML = "开始播放";
+            errEl.innerHTML = "编码出错: " + e.message;
+            return;
+        }
+        rafId = raf(frameLoop);
     }
 
     function stop() {
         playing = false;
         $("btn_play").innerHTML = "开始播放";
-        if (timer) { window.clearTimeout(timer); timer = null; }
+        if (rafId !== null) { caf(rafId); rafId = null; }
         saveState();
+        refreshStats();
     }
 
     /* 帧转储导出（契约 14 格式） */
@@ -350,8 +534,32 @@ button { cursor: pointer; margin-right: 6px; }
     $("btn_reset").addEventListener("click", function () {
         nextBlockId = 0;
         framesShown = 0;
+        /* 缓冲里已按旧游标编好的帧作废，预渲染游标退回显示游标 */
+        qHead = 0; qTail = 0; qCount = 0;
+        encodeBlockId = 0;
         saveState();
         refreshStats();
+    });
+
+    /*
+     * 窗口尺寸变了要重建离屏缓冲。防抖 200 ms——拖动窗口期间反复重建离屏画布，
+     * 只会把预渲染预算吃光，反而制造欠载。
+     */
+    var resizeTimer = null;
+    window.addEventListener("resize", function () {
+        if (!sess || !playing) { return; }
+        if (resizeTimer) { window.clearTimeout(resizeTimer); }
+        resizeTimer = window.setTimeout(function () {
+            resizeTimer = null;
+            if (!playing) { return; }
+            try {
+                rebuildPipeline();
+                while (qCount < RING_CAP) { if (!produceFrame()) { break; } }
+            } catch (e) {
+                stop();
+                errEl.innerHTML = "编码出错: " + e.message;
+            }
+        }, 200);
     });
 
     $("btn_dump").addEventListener("click", exportDump);
