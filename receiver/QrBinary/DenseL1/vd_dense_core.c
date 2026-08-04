@@ -1205,11 +1205,28 @@ static int find_finders(const vdd_image *img, const vdd_lock *lock,
     group_t groups[MAX_GROUP];
     int n_groups = 0;
     if (lock && lock->valid) {
-        int win = (w > h ? w : h) / 10 + 16;
-        for (int k = 0; k < 4; k++) {
-            int cx = (int)lock->corners[k][0], cy = (int)lock->corners[k][1];
-            scan_rows(img, lt, cy - win, cy + win, cx - win, cx + win,
-                      groups, &n_groups);
+        /*
+         * 跟踪窗先小后大。
+         *
+         * 原本只有一档 max(w,h)/10 + 16——这是**图像尺寸的固定比例**，1080p 下
+         * 是 208 px 尚可，4K 下就成了 400 px：四个 800×800 的窗合计 2.56 M 像素，
+         * 占满帧的 31%。真机遥测里跟踪态的定位耗时中位数因此仍有 20.7 ms，
+         * 「跟踪」几乎没省下什么，与全图搜索只差三倍。
+         *
+         * 但窗口不能一味调小：手一晃符号就移出小窗，丢锁的代价是一次全图搜索，
+         * 比省下的多得多。所以改成两档：先试小窗，找不齐四个再用原来的大窗，
+         * 都不行才丢锁回全图。命中时省 90% 以上的扫描量，落空时只多付一次
+         * 小窗扫描（本身就便宜），准确性一个字节都不让。
+         */
+        static const int WIN_DIV[2] = { 60, 10 };
+        for (int pass = 0; pass < 2 && n_groups < 4; pass++) {
+            n_groups = 0;
+            int win = (w > h ? w : h) / WIN_DIV[pass] + 16;
+            for (int k = 0; k < 4; k++) {
+                int cx = (int)lock->corners[k][0], cy = (int)lock->corners[k][1];
+                scan_rows(img, lt, cy - win, cy + win, cx - win, cx + win,
+                          groups, &n_groups);
+            }
         }
     } else {
         scan_rows(img, lt, 0, h, 0, w, groups, &n_groups);
