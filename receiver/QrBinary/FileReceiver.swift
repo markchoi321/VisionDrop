@@ -14,6 +14,12 @@ import SwiftUI
 enum ScanResolution: String, CaseIterable, Identifiable {
     case hd720p = "720p"
     case hd1080p = "1080p"
+    /*
+     * 高档位（112/128 格）在 1080p 下每格只剩 7.8 像素，判决余量被压到临界点。
+     * 同样的取景换到 4K，每格像素翻一倍多，代价是 find_finders 的耗时按像素数
+     * 线性上升。设备不支持时会自动退回 1080p。
+     */
+    case uhd4K = "4K"
 
     var id: String { rawValue }
 }

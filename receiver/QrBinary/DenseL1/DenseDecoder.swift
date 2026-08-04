@@ -120,8 +120,21 @@ final class DenseDecoder {
 
     private func run(_ img: inout vdd_image, grid n: Int32) throws -> Data {
         var diag = vdd_diag()
-        let ret = frameBuf.withUnsafeMutableBufferPointer { out in
+        var ret = frameBuf.withUnsafeMutableBufferPointer { out in
             vdd_decode_diag(&img, n, &lock, out.baseAddress, out.count, &diag)
+        }
+        /*
+         * 跟踪态纠错失败就丢锁重来一次。跟踪态只在上一帧的四角附近开小窗精定位，
+         * 手持晃动下这个起点会偏，格数越多每格像素越少，同样的角点误差占比越大——
+         * 真机 N=112 的诊断包里有三帧标记为纠错失败，同样的像素做一次全图搜索
+         * 却是 18/18 整帧解出。代价只在失败帧上付（全图搜索比跟踪态贵约 5 ms），
+         * 而失败帧本来就没有产出。
+         */
+        if ret == VDD_ERR_RS && lock.valid != 0 {
+            lock.valid = 0
+            ret = frameBuf.withUnsafeMutableBufferPointer { out in
+                vdd_decode_diag(&img, n, &lock, out.baseAddress, out.count, &diag)
+            }
         }
         /* 失败时 diag 也带回了走得最远那个候选的测量值，现场排查要靠它 */
         diagnostics = diag

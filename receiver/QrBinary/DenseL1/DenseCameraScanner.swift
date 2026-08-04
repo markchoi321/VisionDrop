@@ -355,8 +355,12 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         try? FileManager.default.removeItem(at: denseDiagDir())
         successStreak = 0
         box.decoder.resetLock()
-        let preset: AVCaptureSession.Preset =
-            (resolution == .hd720p) ? .hd1280x720 : .hd1920x1080
+        let preset: AVCaptureSession.Preset
+        switch resolution {
+        case .hd720p: preset = .hd1280x720
+        case .hd1080p: preset = .hd1920x1080
+        case .uhd4K: preset = .hd4K3840x2160
+        }
         sessionQueue.async { [weak self] in
             self?.configure(preset: preset)
             self?.session.startRunning()
@@ -384,7 +388,6 @@ final class DenseCameraScanner: NSObject, ObservableObject,
     /// begin/commitConfiguration 区间是线程安全的）与 box.device
     private nonisolated func configure(preset: AVCaptureSession.Preset) {
         session.beginConfiguration()
-        session.sessionPreset = preset
 
         guard let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: dev),
@@ -394,6 +397,10 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         }
         session.addInput(input)
         box.device = dev
+
+        /* canSetSessionPreset 取决于当前输入，必须在 addInput 之后问。
+           4K 并非所有机型/镜头都支持，不能设就退回 1080p */
+        session.sessionPreset = session.canSetSessionPreset(preset) ? preset : .hd1920x1080
 
         if (try? dev.lockForConfiguration()) != nil {
             /*
