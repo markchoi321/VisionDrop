@@ -115,6 +115,19 @@ class FileReceiver: ObservableObject {
     private var backgroundObserver: NSObjectProtocol?
 
     init() {
+        /*
+         * Debug 构建的性能与 Release 差一个量级以上，而且差的正好是本项目最热的
+         * 那类代码——紧密的 UInt64 异或循环，-Onone 下每次数组访问都带边界检查、
+         * 不内联、ARC 也不消除。实测同一台机器上：
+         *   1 MB 文件的回代    Debug 6026 ms / Release 26 ms
+         *   秩 2000 时单块消元  Debug 9.4 ms / Release 0.03 ms
+         * 这个差距已经三次被当成「性能 bug」来查（合并慢、收齐瞬间卡死、
+         * 传输后半程界面卡顿），所以直接在日志里点明，别再浪费一轮排查。
+         */
+        #if DEBUG
+        addLog("当前为 Debug 构建，喷泉码的消元与回代比 Release 慢约 300 倍；" +
+               "测性能请切 Release", isError: true)
+        #endif
         restoreProgress()
         backgroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
