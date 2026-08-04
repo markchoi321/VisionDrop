@@ -8,7 +8,7 @@
 
 import Foundation
 
-struct BitSet {
+struct BitSet: Sendable {
     /// 位数（等于 K）
     let bitCount: Int
     /// 底层字数组，低位字在前

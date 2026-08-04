@@ -18,7 +18,7 @@ import Foundation
  *   早先它也走 neighbors，每个置位写 3 字节索引，K=2517 时单行就要 3.7KB、
  *   整个基约 10MB，每次自动存盘要 300ms+ 并且卡在主 actor 上。
  */
-struct PendingRecord {
+struct PendingRecord: Sendable {
     let blockId: UInt32
     /// 稀疏邻居表（LT 用）；RLNC 走 coeff 时为空
     let neighbors: [Int]
@@ -34,7 +34,7 @@ struct PendingRecord {
     }
 }
 
-struct SolvedRecord {
+struct SolvedRecord: Sendable {
     let index: Int
     let data: [UInt8]
 }

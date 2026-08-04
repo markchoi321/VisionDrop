@@ -362,18 +362,22 @@ class FileReceiver: ObservableObject {
      * 但真正的文件写入挪到串行队列——扫描时这条路径每 5 秒走一次，
      * 阻塞主 actor 会直接掉帧。串行保证同一会话的多次写入不会互相覆盖。
      */
+    /*
+     * 自动保存。主 actor 上只取快照，编码与写盘全部在 ioQueue 上。
+     *
+     * 早先编码也在主 actor 上：1 MB 文件的消元基编出来约 1.6 MB，逐字节追加
+     * 在 Debug 下要几百毫秒，而这个函数每 5 秒来一次。真机表现是扫码界面持续
+     * 卡顿、速率读数根本看不清，退出扫描后会话列表才一格一格补进度——那是
+     * 积压的主 actor 任务在排队。取快照本身很便宜：消元基只增不改，快照里
+     * 全是数组引用的持有，没有深拷贝。
+     */
     private func persist(_ session: ReceiveSession) {
-        let started = Date()
-        let data = ProgressStore.encode([session])
+        let snap = ProgressStore.snapshot(session)
         let url = ProgressStore.fileURL(for: session.sessionId)
         session.lastSavedAt = Date()
-        let encodeMs = Diagnostics.elapsedMs(since: started)
-        let sid = SessionId.hex(session.sessionId)
-        if encodeMs > 200 {
-            addLog("进度编码偏慢：\(sid) 耗时 \(encodeMs) ms，\(data.count / 1024) KB")
-        }
         ioQueue.async { [weak self] in
             do {
+                let data = ProgressStore.encode([snap])
                 try ProgressStore.ensureDirectory()
                 try data.write(to: url, options: .atomic)
             } catch {

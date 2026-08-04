@@ -55,39 +55,87 @@ enum ProgressStore {
 
     // MARK: - 编码
 
-    /// 打包多个会话，sessionCount 可 > 1，用于跨设备迁移导出
-    static func encode(_ sessions: [ReceiveSession]) -> Data {
-        var out: [UInt8] = []
-        out.append(contentsOf: magic)
-        ByteOps.appendUInt16(&out, formatVersion)
-        ByteOps.appendUInt16(&out, UInt16(min(sessions.count, Int(UInt16.max))))
-        for s in sessions { appendSession(&out, s) }
-        return Data(out)
+    /*
+     * 一个会话的可搬运快照。
+     *
+     * 取快照必须在主 actor 上做（要读解码器状态），但编码是纯数据变换，
+     * 可以拿到后台去——这是必须拆开的理由：1 MB 文件的消元基编码出来约 1.6 MB，
+     * 逐字节追加在 Debug 下要几百毫秒，而自动保存每 5 秒来一次。真机表现是
+     * 扫码界面持续卡顿、速率读数根本看不清，退出扫描后会话列表才一格一格
+     * 补上进度——那是积压的主 actor 任务在排队。
+     *
+     * 快照本身很便宜：消元基是只增不改的（add 只在空槽位写入，已有的行永远
+     * 不动），所以这里全是数组引用的持有，没有深拷贝。
+     */
+    struct SessionSnapshot: Sendable {
+        var sessionId: UInt32
+        var K: Int
+        var T: Int
+        var flags: UInt8
+        var metaBytes: [UInt8]
+        var solved: [SolvedRecord]
+        var pending: [PendingRecord]
+        var framesAccepted: Int
+        var framesRejected: Int
+        var blocksReceived: Int
+        var blocksDuplicate: Int
+        var maxBlockId: UInt32
+        var firstSeenAt: Double
+        var lastSeenAt: Double
     }
 
-    private static func appendSession(_ out: inout [UInt8], _ s: ReceiveSession) {
-        ByteOps.appendUInt32(&out, s.sessionId)
-        ByteOps.appendUInt24(&out, UInt32(s.K))
-        ByteOps.appendUInt16(&out, UInt16(s.T))
-
+    /// 在主 actor 上取快照。只读解码器，不做编码。
+    static func snapshot(_ s: ReceiveSession) -> SessionSnapshot {
         var flags: UInt8 = 0
         if s.compressed { flags |= 0x01 }
         if s.meta != nil { flags |= 0x02 }
         if s.codec == .peeling { flags |= 0x04 }
-        out.append(flags)
+        return SessionSnapshot(
+            sessionId: s.sessionId, K: s.K, T: s.T, flags: flags,
+            metaBytes: s.meta?.rawHeader ?? [],
+            solved: s.decoder.snapshotSolved(),
+            pending: s.decoder.snapshotPending(),
+            framesAccepted: s.stats.framesAccepted,
+            framesRejected: s.stats.framesRejected,
+            blocksReceived: s.stats.blocksReceived,
+            blocksDuplicate: s.stats.blocksDuplicate,
+            maxBlockId: s.stats.maxBlockId,
+            firstSeenAt: s.stats.firstSeenAt.timeIntervalSince1970,
+            lastSeenAt: s.stats.lastSeenAt.timeIntervalSince1970)
+    }
 
-        let metaBytes = s.meta?.rawHeader ?? []
-        ByteOps.appendUInt16(&out, UInt16(metaBytes.count))
-        out.append(contentsOf: metaBytes)
+    /// 打包多个会话，sessionCount 可 > 1，用于跨设备迁移导出
+    static func encode(_ sessions: [ReceiveSession]) -> Data {
+        encode(sessions.map(snapshot))
+    }
 
-        let solved = s.decoder.snapshotSolved()
+    /// 快照 -> 字节。纯数据变换，可在任意线程执行
+    static func encode(_ snapshots: [SessionSnapshot]) -> Data {
+        var out: [UInt8] = []
+        out.append(contentsOf: magic)
+        ByteOps.appendUInt16(&out, formatVersion)
+        ByteOps.appendUInt16(&out, UInt16(min(snapshots.count, Int(UInt16.max))))
+        for s in snapshots { appendSession(&out, s) }
+        return Data(out)
+    }
+
+    private static func appendSession(_ out: inout [UInt8], _ s: SessionSnapshot) {
+        ByteOps.appendUInt32(&out, s.sessionId)
+        ByteOps.appendUInt24(&out, UInt32(s.K))
+        ByteOps.appendUInt16(&out, UInt16(s.T))
+        out.append(s.flags)
+
+        ByteOps.appendUInt16(&out, UInt16(s.metaBytes.count))
+        out.append(contentsOf: s.metaBytes)
+
+        let solved = s.solved
         ByteOps.appendUInt32(&out, UInt32(solved.count))
         for rec in solved {
             ByteOps.appendUInt24(&out, UInt32(rec.index))
             out.append(contentsOf: rec.data)
         }
 
-        let pending = s.decoder.snapshotPending()
+        let pending = s.pending
         ByteOps.appendUInt32(&out, UInt32(pending.count))
         for rec in pending {
             ByteOps.appendUInt32(&out, rec.blockId)
@@ -103,14 +151,14 @@ enum ProgressStore {
             out.append(contentsOf: rec.payload)
         }
 
-        ByteOps.appendUInt32(&out, UInt32(s.stats.framesAccepted))
-        ByteOps.appendUInt32(&out, UInt32(s.stats.framesRejected))
-        ByteOps.appendUInt32(&out, UInt32(s.stats.blocksReceived))
-        ByteOps.appendUInt32(&out, UInt32(s.stats.blocksDuplicate))
-        ByteOps.appendUInt32(&out, s.stats.maxBlockId)
+        ByteOps.appendUInt32(&out, UInt32(s.framesAccepted))
+        ByteOps.appendUInt32(&out, UInt32(s.framesRejected))
+        ByteOps.appendUInt32(&out, UInt32(s.blocksReceived))
+        ByteOps.appendUInt32(&out, UInt32(s.blocksDuplicate))
+        ByteOps.appendUInt32(&out, s.maxBlockId)
         ByteOps.appendUInt32(&out, 0)                                   // reserved
-        ByteOps.appendDouble(&out, s.stats.firstSeenAt.timeIntervalSince1970)
-        ByteOps.appendDouble(&out, s.stats.lastSeenAt.timeIntervalSince1970)
+        ByteOps.appendDouble(&out, s.firstSeenAt)
+        ByteOps.appendDouble(&out, s.lastSeenAt)
     }
 
     // MARK: - 解码

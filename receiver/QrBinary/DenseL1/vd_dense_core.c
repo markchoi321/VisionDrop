@@ -993,7 +993,15 @@ typedef struct {
     int16_t raw[LT_MAXW * LT_MAXH];     /* 建表用的临时块均值，随结构体一起分配 */
 } local_thresh;
 
-static void lt_build(const vdd_image *img, local_thresh *lt) {
+/*
+ * 局部阈值表。roi 非空时只统计与该矩形相交的块，其余块按「纯色块」走继承路径。
+ *
+ * 跟踪态下符号的位置是已知的，没有理由为了四个小窗的二值化去扫整幅图——
+ * 4K 全图是 207 万次采样（本身已经隔行隔列），而四个跟踪窗加起来才十万像素。
+ * 分块索引保持不变，所以 px_dark 一个字都不用改。
+ */
+static void lt_build_roi(const vdd_image *img, local_thresh *lt,
+                         const int (*wins)[4], int n_wins) {
     int w = img->width, h = img->height;
     lt->bw = (w + LT_BLOCK - 1) / LT_BLOCK;
     lt->bh = (h + LT_BLOCK - 1) / LT_BLOCK;
@@ -1007,6 +1015,16 @@ static void lt_build(const vdd_image *img, local_thresh *lt) {
         for (int bx = 0; bx < lt->bw; bx++) {
             int x0 = bx * w / lt->bw, x1 = (bx + 1) * w / lt->bw;
             int y0 = by * h / lt->bh, y1 = (by + 1) * h / lt->bh;
+            if (n_wins > 0) {
+                int hit = 0;
+                for (int i = 0; i < n_wins && !hit; i++)
+                    hit = !(x1 <= wins[i][0] || x0 >= wins[i][2] ||
+                            y1 <= wins[i][1] || y0 >= wins[i][3]);
+                if (!hit) {
+                    raw[by * lt->bw + bx] = -1;  /* 窗外，交给继承 */
+                    continue;
+                }
+            }
             int mn = 255, mx = 0;
             for (int y = y0; y < y1; y += 2) {
                 for (int x = x0; x < x1; x += 2) {
@@ -1200,7 +1218,23 @@ static int find_finders(const vdd_image *img, const vdd_lock *lock,
        约 48 KB，放堆上而非 static——static 会被并行调用的两个线程互相踩 */
     local_thresh *lt = (local_thresh *)malloc(sizeof(local_thresh));
     if (!lt) return -1;
-    lt_build(img, lt);
+    /*
+     * 阈值表只在真正会被扫描的地方建。跟踪态下 scan_rows 只跑四角的窗，
+     * 阈值表却按整幅图算，4K 全图是 207 万次采样（本身已隔行隔列），而四个
+     * 大窗加起来才几十万像素。按大窗取（不是小窗），两档重试才都有阈值可用。
+     */
+    int wins[4][4];
+    int n_wins = 0;
+    if (lock && lock->valid) {
+        int m = (w > h ? w : h) / 10 + 32;
+        for (int k = 0; k < 4; k++) {
+            int cx = (int)lock->corners[k][0], cy = (int)lock->corners[k][1];
+            wins[k][0] = cx - m; wins[k][1] = cy - m;
+            wins[k][2] = cx + m; wins[k][3] = cy + m;
+        }
+        n_wins = 4;
+    }
+    lt_build_roi(img, lt, wins, n_wins);
 
     group_t groups[MAX_GROUP];
     int n_groups = 0;
