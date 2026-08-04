@@ -128,6 +128,12 @@ private final class TelemetryLog: @unchecked Sendable {
         var duplicate: Bool       // 是否被判为重复帧
         var tracking: Bool        // 解码时是否处于跟踪锁定态
         var exposureLocked: Bool  // 曝光/白平衡是否已锁
+        /*
+         * 解码本身的耗时。没有它就分不清「送检帧率低」是解码跟不上还是
+         * 单纯在等下一帧——4K 那一轮两种解释都能套上观测到的 ~100ms 间隔，
+         * 只能靠这一列定案。
+         */
+        var decodeMs: Double
     }
 
     /// 条数上限。30fps 扫十分钟约 18000 条，再多也没有分析价值，
@@ -169,7 +175,7 @@ private final class TelemetryLog: @unchecked Sendable {
         var s = "t_ms,result,grid,cell_px,beta,thr_r,thr_g,thr_b,"
         s += "halfgap_r,halfgap_g,halfgap_b,bow,header_disagree,payload_len,"
         s += "rs_blocks,rs_blocks_ok,rs_corrected,rs_erasures,"
-        s += "frame_bytes,duplicate,tracking,exposure_locked\n"
+        s += "frame_bytes,duplicate,tracking,exposure_locked,decode_ms\n"
         s.reserveCapacity(snapshot.count * 128)
         for r in snapshot {
             let d = r.diag
@@ -181,7 +187,8 @@ private final class TelemetryLog: @unchecked Sendable {
             s += "\(d.header_disagree),\(d.payload_len),"
             s += "\(d.rs_blocks),\(d.rs_blocks_ok),\(d.rs_corrected),\(d.rs_erasures),"
             s += "\(r.frameBytes),\(r.duplicate ? 1 : 0),"
-            s += "\(r.tracking ? 1 : 0),\(r.exposureLocked ? 1 : 0)\n"
+            s += "\(r.tracking ? 1 : 0),\(r.exposureLocked ? 1 : 0),"
+            s += String(format: "%.1f\n", r.decodeMs)
         }
         return s
     }
@@ -197,16 +204,40 @@ private func denseDiagDir() -> URL {
         .appendingPathComponent("vdd-diag", isDirectory: true)
 }
 
-/// 把 BGRA 缓冲写成 24 位 BMP。用 BMP 而非 PNG：格式极简、无压缩、
-/// 与 C 侧 harness 直接兼容，导出的帧可以原样喂给 vd_dense_core 复现问题。
-private func writeBMP(pixelBuffer: CVPixelBuffer, to url: URL) -> Bool {
+/*
+ * 采集缓冲的一份拷贝。留样落盘不能在 decodeQueue 上做完：4K 一帧是 8.3M
+ * 像素，逐像素转 BMP 再写 24 MB 文件在真机上要一秒以上，而这条队列同时
+ * 是解码路径——诊断包里每个失败帧后面都跟着 1~2 秒的空档，送检帧率被自己
+ * 的诊断代码拖到 2.4 fps。CVPixelBuffer 归采集池所有，不能跨帧持有，
+ * 所以先按行 memcpy 拷出来（33 MB 的 memcpy 是毫秒级），再交给后台队列。
+ */
+private struct FrameCopy {
+    let bytes: [UInt8]
+    let width: Int
+    let height: Int
+    let stride: Int
+}
+
+private func copyBGRA(_ pixelBuffer: CVPixelBuffer) -> FrameCopy? {
     CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return false }
+    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
     let w = CVPixelBufferGetWidth(pixelBuffer)
     let h = CVPixelBufferGetHeight(pixelBuffer)
     let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-    let src = base.assumingMemoryBound(to: UInt8.self)
+    var bytes = [UInt8](repeating: 0, count: stride * h)
+    bytes.withUnsafeMutableBytes { dst in
+        _ = memcpy(dst.baseAddress!, base, stride * h)
+    }
+    return FrameCopy(bytes: bytes, width: w, height: h, stride: stride)
+}
+
+/// 把 BGRA 缓冲写成 24 位 BMP。用 BMP 而非 PNG：格式极简、无压缩、
+/// 与 C 侧 harness 直接兼容，导出的帧可以原样喂给 vd_dense_core 复现问题。
+private func writeBMP(_ frame: FrameCopy, to url: URL) -> Bool {
+    let w = frame.width, h = frame.height, stride = frame.stride
+    return frame.bytes.withUnsafeBufferPointer { buf -> Bool in
+    let src = buf.baseAddress!
 
     let rowBytes = (w * 3 + 3) / 4 * 4
     var data = Data(count: 54 + rowBytes * h)
@@ -232,6 +263,7 @@ private func writeBMP(pixelBuffer: CVPixelBuffer, to url: URL) -> Bool {
         }
     }
     return (try? data.write(to: url)) != nil
+    }
 }
 
 @MainActor
@@ -328,6 +360,8 @@ final class DenseCameraScanner: NSObject, ObservableObject,
     /// 串行队列 + alwaysDiscardsLateVideoFrames 已实现「忙时丢帧」，
     /// 不需要额外的 busy 标志。喷泉码下丢帧只是线性代价。
     private let decodeQueue = DispatchQueue(label: "dense.decode", qos: .userInitiated)
+    /// 留样落盘队列。串行 + 低优先级，绝不和解码抢 CPU
+    private let dumpQueue = DispatchQueue(label: "dense.dump", qos: .utility)
     private let box = DecodeBox()
     private var isRunning = false
     /// 连续解码成功次数，达到阈值即锁定 AE/AWB
@@ -424,6 +458,19 @@ final class DenseCameraScanner: NSObject, ObservableObject,
             if dev.isExposurePointOfInterestSupported {
                 dev.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
             }
+            /*
+             * 限帧。发送端屏幕以 10 fps 播放，采到 20 fps 就足够——每个屏幕帧
+             * 有两次机会避开换帧过渡期，再高纯属白烧。4K 一帧 BGRA 是 33 MB，
+             * 30 fps 与 20 fps 之间差着约 330 MB/s 的 ISP 输出与内存带宽，
+             * 而这些帧多半直接被 alwaysDiscardsLateVideoFrames 丢掉。
+             * 发热主要来自这里，不是解码。
+             */
+            let wanted = CMTime(value: 1, timescale: 20)
+            if let range = dev.activeFormat.videoSupportedFrameRateRanges.first,
+               CMTimeCompare(wanted, range.minFrameDuration) >= 0,
+               CMTimeCompare(wanted, range.maxFrameDuration) <= 0 {
+                dev.activeVideoMinFrameDuration = wanted
+            }
             dev.unlockForConfiguration()
         }
 
@@ -497,17 +544,19 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         // 现场诊断：把这一帧原样落盘，可直接喂给 C 侧 harness 复现
-        if box.takeDumpRequest() {
+        if box.takeDumpRequest(), let copy = copyBGRA(pixelBuffer) {
             let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             let name = "vdd-frame-\(Int(Date().timeIntervalSince1970)).bmp"
             let url = dir.appendingPathComponent(name)
-            box.dumpURL = writeBMP(pixelBuffer: pixelBuffer, to: url) ? url : nil
-            let saved = box.dumpURL
-            Task { @MainActor [weak self] in self?.dumpedFrameURL = saved }
+            dumpQueue.async { [weak self] in
+                let ok = writeBMP(copy, to: url)
+                Task { @MainActor [weak self] in self?.dumpedFrameURL = ok ? url : nil }
+            }
         }
 
         var decoded: Data?
         var failure: DenseDecoder.Failure?
+        let t0 = CACurrentMediaTime()
         do {
             decoded = try box.decoder.decode(pixelBuffer: pixelBuffer, grid: box.grid)
         } catch let e as DenseDecoder.Failure {
@@ -516,6 +565,7 @@ final class DenseCameraScanner: NSObject, ObservableObject,
             failure = .badArgs
         }
 
+        let decodeMs = (CACurrentMediaTime() - t0) * 1000
         let result = decoded
         let err = failure
         let diag = box.decoder.diagnostics
@@ -529,22 +579,26 @@ final class DenseCameraScanner: NSObject, ObservableObject,
            便于把图和日志行对上。 */
         if let e = err,
            let n = box.claimFailureShot(at: at, limit: kMaxFailureShots,
-                                        minGap: kFailureShotGap) {
+                                        minGap: kFailureShotGap),
+           let copy = copyBGRA(pixelBuffer) {
             let dir = denseDiagDir()
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let ms = Int((at - box.scanStart) * 1000)
             let name = String(format: "fail%02d-%@-%dms.bmp", n, e.logName, ms)
-            _ = writeBMP(pixelBuffer: pixelBuffer, to: dir.appendingPathComponent(name))
+            dumpQueue.async {
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                _ = writeBMP(copy, to: dir.appendingPathComponent(name))
+            }
         }
 
         Task { @MainActor [weak self] in
-            self?.finish(result, err, diag, tracking, at)
+            self?.finish(result, err, diag, tracking, at, decodeMs)
         }
     }
 
     private func finish(_ decoded: Data?, _ failure: DenseDecoder.Failure?,
                         _ diag: vdd_diag, _ tracking: Bool = false,
-                        _ at: CFTimeInterval = CACurrentMediaTime()) {
+                        _ at: CFTimeInterval = CACurrentMediaTime(),
+                        _ decodeMs: Double = 0) {
         processedMeter.record()
         var duplicate = false
         defer {
@@ -556,7 +610,8 @@ final class DenseCameraScanner: NSObject, ObservableObject,
                 frameBytes: decoded?.count ?? 0,
                 duplicate: duplicate,
                 tracking: tracking,
-                exposureLocked: isLocked))
+                exposureLocked: isLocked,
+                decodeMs: decodeMs))
         }
 
         guard let frame = decoded else {
