@@ -1219,7 +1219,8 @@ static int find_finders(const vdd_image *img, const vdd_lock *lock,
          * 小窗扫描（本身就便宜），准确性一个字节都不让。
          */
         static const int WIN_DIV[2] = { 60, 10 };
-        for (int pass = 0; pass < 2 && n_groups < 4; pass++) {
+        /* wide=1 时直接从大窗开始：调用方已经知道小窗那套角点解不出来 */
+        for (int pass = lock->wide ? 1 : 0; pass < 2 && n_groups < 4; pass++) {
             n_groups = 0;
             int win = (w > h ? w : h) / WIN_DIV[pass] + 16;
             for (int k = 0; k < 4; k++) {
@@ -1509,7 +1510,9 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
     double ms_sample = 0, ms_decide = 0, ms_rs = 0;
 
     double corners[4][2];
-    if (find_finders(img, lock, corners) != 0) {
+    int rc_find = find_finders(img, lock, corners);
+    if (lock) lock->wide = 0;              /* 一次性提示，用完即清 */
+    if (rc_find != 0) {
         if (lock && lock->valid) {
             /* 跟踪窗失锁则回退全图 */
             if (find_finders(img, NULL, corners) != 0) {
