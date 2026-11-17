@@ -35,8 +35,19 @@ enum {
      * 让调用方省掉无谓的重试：这类帧多半是屏幕换帧过渡期抓到的，数据区被新旧
      * 两帧混合污染，换个定位起点重来一次结果一样，而 4K 下一次全图搜索不便宜。
      */
-    VDD_ERR_SIGNAL = -8
+    VDD_ERR_SIGNAL = -8,
+    /*
+     * 与跟踪锁里上一个成功帧是同一个符号（抽样格判决值几乎全同），未做全采样
+     * 与纠错，frame_out 未写入。**这不是失败**：同一个屏幕帧被相机连续扫到
+     * 多次是常态（真机 N=112 遥测里 51% 的成功帧是重复），调用方应当沿用上一帧
+     * 的字节，不计失败、不触发重试。用负码而非正值，是为了让「>0 即 frame_out
+     * 有效」这条约定不被打破。
+     */
+    VDD_DUPLICATE = -9
 };
+
+/* 抽样格上限：坏帧早退与重复帧判定共用同一批抽样位置 */
+#define VDD_PROBE_MAX 1024
 
 /* n_grid 传此值表示自动判别档位（逐个候选试到头部校验通过） */
 #define VDD_GRID_AUTO 0
@@ -64,11 +75,21 @@ typedef struct {
      */
     int wide;
     int valid;
+    /*
+     * 重复帧判定：上一个成功帧在抽样格上的最终判决值。抽样位置只由
+     * 档位、载荷长度与色数决定，三者都对上才可比。dup_n = 0 表示无记录。
+     */
+    int dup_grid;
+    int dup_len;
+    int dup_colors;             /* 8 色记录的是格值 0..7，4 色记录的是 2 bit 值 0..3 */
+    int dup_n;
+    uint8_t dup_v[VDD_PROBE_MAX];
 } vdd_lock;
 
 /* 上一次解码的测量值，供界面诊断与真机标定 */
 typedef struct {
     int grid;                   /* 实际使用的档位 */
+    int colors;                 /* 头部调制位读出的色数：8 或 4；头部未通过时为 0 */
     double cell_px;             /* 每格像素数 */
     double beta;                /* 横向形状参数 */
     double thr[3];              /* 三通道判决阈值 */
@@ -97,10 +118,18 @@ typedef struct {
     double ms_probe;            /* 档位与朝向判别，逐候选试解头部 */
     double ms_beta;             /* 横向形状参数标定，仅建锁首帧执行 */
     double ms_sample;           /* 逐格采样 */
-    double ms_decide;           /* 偏移校正与八色判决 */
+    double ms_decide;           /* 偏移校正与最近邻判决（8 色或 4 色） */
     double ms_rs;               /* 解交织与 RS errata 纠错 */
     double ms_geom;             /* [probe 内] 边缘校正，所有候选合计 */
     double ms_calib;            /* [probe 内] 定标条阈值与八色调色板，所有候选合计 */
+    /*
+     * 全采样之前的抽样观测（约 1/16 的数据格，均匀覆盖上下全程）。
+     * 坏帧早退与重复帧判定都只看这几个数，现场门限是否合适要靠它们复核。
+     */
+    int probe_cells;            /* 抽样格数；0 = 数据区太小没做抽样 */
+    int probe_low;              /* 其中低置信格数（与擦除同一判据） */
+    int probe_diff;             /* 与上一成功帧抽样值不同的格数；-1 = 无可比记录 */
+    int zones;                  /* 分区调色板的每边分区数；0 = 未启用 */
 } vdd_diag;
 
 /*
@@ -120,8 +149,11 @@ int vdd_decode(const vdd_image *img, int n_grid, vdd_lock *lock,
 int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
                     uint8_t *frame_out, size_t frame_cap, vdd_diag *diag);
 
-/* 该 N 的净载荷上限（字节），非法 N 返回 0。与规约 6 节一致。 */
+/* 该 N 的 8 色净载荷上限（字节），非法 N 返回 0。与规约 6 节一致。 */
 int vdd_net_capacity(int n_grid);
+
+/* 同上，按色数查询：colors 取 8 或 4，其他值返回 0 */
+int vdd_net_capacity_colors(int n_grid, int colors);
 
 /* 自检入口：RS errata 编解码随机回归（trials 次），全部通过返回 0 */
 int vdd_selftest_rs(int trials);

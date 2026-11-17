@@ -77,6 +77,33 @@ struct DenseDecoderTests {
         #expect(DenseDecoder.netCapacity(grid: 100) == 0)
     }
 
+    /// 4 色降级档每格 2 bit，数值与 protocol/dense/vectors/dense_capacity4.txt 一致
+    @Test("4 色档容量表与规约一致")
+    func capacities4() {
+        let expected: [Int32: Int32] = [64: 746, 80: 1242, 96: 1834, 112: 2554, 128: 3370]
+        for (n, net) in expected {
+            #expect(DenseDecoder.netCapacity(grid: n, colors: 4) == net, "N=\(n)")
+        }
+        #expect(DenseDecoder.netCapacity(grid: 96, colors: 5) == 0)
+    }
+
+    /// 4 色金图像：色数从头部调制位读出，g128_4c_xtalk 是同条件下 8 色解不出的强串扰
+    @Test("4 色金图像读出色数")
+    func fourColorGolden() throws {
+        guard let dir = denseVectorsURL() else {
+            Issue.record("测试 bundle 缺少 vectors/dense 资源")
+            return
+        }
+        for name in ["g96_4c_dist.bmp", "g128_4c_xtalk.bmp", "g96_clean.bmp"] {
+            let (rgb, w, h) = try readBmp(dir.appendingPathComponent(name))
+            let decoder = DenseDecoder()
+            let frame = try decoder.decode(rgb: rgb, width: w, height: h,
+                                           grid: DenseDecoder.gridAuto)
+            #expect(FrameParser.parse([UInt8](frame)) != nil, "\(name) L2 校验失败")
+            #expect(decoder.diagnostics.colors == (name.contains("_4c") ? 4 : 8), "\(name)")
+        }
+    }
+
     @Test("金图像全量解码")
     func goldenImages() throws {
         guard let dir = denseVectorsURL() else {
@@ -100,7 +127,7 @@ struct DenseDecoderTests {
             #expect(FrameParser.parse([UInt8](frame)) != nil, "\(parts[0]) L2 校验失败")
             cases += 1
         }
-        #expect(cases == 8, "金图像应为 8 例，实得 \(cases)")
+        #expect(cases == 10, "金图像应为 10 例（8 色 8 例 + 4 色 2 例），实得 \(cases)")
     }
 
     /// 真机首测栽在这里：发送端 128 格、接收端默认 96 格，定位图形照样找得到
@@ -130,7 +157,7 @@ struct DenseDecoderTests {
             #expect(gotHex == String(parts[2]), "\(parts[0]) 帧字节不一致")
             cases += 1
         }
-        #expect(cases == 8)
+        #expect(cases == 10)
     }
 
     /// 真机第二个坑：符号没有朝向标记，四个定位图形长得一样，
@@ -190,8 +217,18 @@ struct DenseDecoderTests {
         let decoder = DenseDecoder()
         /* 第一帧全图搜索建立锁，第二帧走小窗路径，结果必须一致 */
         let a = try decoder.decode(rgb: rgb, width: w, height: h, grid: 96)
+        #expect(!decoder.lastWasDuplicate)
         let b = try decoder.decode(rgb: rgb, width: w, height: h, grid: 96)
         #expect(a == b)
+        /* 同一符号再扫一次：C 核心抽样即判重，交还的字节与完整解码相同 */
+        #expect(decoder.lastWasDuplicate)
+        /* 换成另一个符号（g96_noise 载荷不同）：抽样格大面积不同，必须完整解码 */
+        let (rgb2, w2, h2) = try readBmp(dir.appendingPathComponent("g96_noise.bmp"))
+        let c = try decoder.decode(rgb: rgb2, width: w2, height: h2, grid: 96)
+        #expect(!decoder.lastWasDuplicate)
+        #expect(c != a)
+        let fresh = try DenseDecoder().decode(rgb: rgb2, width: w2, height: h2, grid: 96)
+        #expect(c == fresh)
         /* 全白图像应报定位失败且不崩 */
         decoder.resetLock()
         let blank = [UInt8](repeating: 255, count: 320 * 320 * 3)

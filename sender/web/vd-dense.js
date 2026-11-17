@@ -6,6 +6,8 @@
  *
  * 8 色调色板取 RGB 立方体八角（借鉴 JAB Code），每格 3 bit：
  * bit2=R bit1=G bit0=B。载荷是一个完整的 L2 帧，L2-L5 协议不变。
+ * 4 色降级档只用 {黑, 青, 品红, 黄} 四角，每格 2 bit，最小色距是面对角线；
+ * 调制方式写在头部版本字节低 2 位（0 = 8 色，1 = 4 色）。
  *
  * 零依赖：GF(256) 与 RS 编码内置于本文件。
  */
@@ -92,6 +94,17 @@
     var PALETTE_CSS = ["#000000", "#0000ff", "#00ff00", "#00ffff",
                        "#ff0000", "#ff00ff", "#ffff00", "#ffffff"];
 
+    /* 4 色档：2 bit 值 -> 格值（黑、青、品红、黄），与 dense_refimpl.PALETTE4 一致 */
+    var PALETTE4 = [0, 3, 5, 6];
+    var MOD_4 = 1;
+
+    /* 每格位数；colors 缺省为 8 */
+    function bitsPerCell(colors) {
+        if (colors === undefined || colors === 8) { return 3; }
+        if (colors === 4) { return 2; }
+        throw new Error("色数只能是 8 或 4: " + colors);
+    }
+
     /* ------------------------------------------------ 结构 */
 
     function inCornerBlock(r, c, N) {
@@ -142,13 +155,15 @@
         return out;
     }
 
-    /* 返回 {free, dataCells, capBytes, net}，按 N 缓存，共享只读 */
+    /* 返回 {free, dataCells, capBytes, net}，按 N 与色数缓存，共享只读 */
     var CAP_CACHE = {};
-    function capacity(N) {
-        if (CAP_CACHE[N]) { return CAP_CACHE[N]; }
+    function capacity(N, colors) {
+        var bpc = bitsPerCell(colors);
+        var key = N + "/" + bpc;
+        if (CAP_CACHE[key]) { return CAP_CACHE[key]; }
         var free = freeCells(N).length;
         var dataCells = free - HEADER_CELLS;
-        var capBytes = Math.floor(dataCells * 3 / 8);
+        var capBytes = Math.floor(dataCells * bpc / 8);
         var net = 0;
         for (var p = capBytes; p > 0; p--) {
             if (p + RS_PARITY * Math.ceil(p / RS_DATA_MAX) <= capBytes) {
@@ -157,7 +172,7 @@
             }
         }
         var r = { free: free, dataCells: dataCells, capBytes: capBytes, net: net };
-        CAP_CACHE[N] = r;
+        CAP_CACHE[key] = r;
         return r;
     }
 
@@ -174,10 +189,10 @@
         return c;
     }
 
-    function buildHeader(payloadLen) {
+    function buildHeader(payloadLen, colors) {
         var h = new Uint8Array(5);
         h[0] = MAGIC;
-        h[1] = VERSION << 4;
+        h[1] = (VERSION << 4) | (bitsPerCell(colors) === 2 ? MOD_4 : 0);
         h[2] = (payloadLen >>> 8) & 0xFF;
         h[3] = payloadLen & 0xFF;
         h[4] = crc8(h, 4);
@@ -267,9 +282,11 @@
         return cells;
     }
 
-    /* payload(Uint8Array) -> {n: N, cells: Uint8Array(N*N)，值 0-7} */
-    function encode(payload, N) {
-        var cap = capacity(N);
+    /* payload(Uint8Array) -> {n: N, cells: Uint8Array(N*N)，值 0-7}。
+       colors 取 8（缺省）或 4；4 色档的数据格只出现 PALETTE4 里的格值 */
+    function encode(payload, N, colors) {
+        var bpc = bitsPerCell(colors);
+        var cap = capacity(N, colors);
         if (payload.length > cap.net) {
             throw new Error("载荷超出容量: N=" + N + " len=" + payload.length +
                 " net=" + cap.net);
@@ -279,7 +296,7 @@
 
         /* 头部：40 bit x 3 副本，白=0 黑=1 */
         var free = freeCells(N);
-        var head = buildHeader(payload.length);
+        var head = buildHeader(payload.length, colors);
         var bits = [];
         for (i = 0; i < 5; i++) {
             for (var b = 7; b >= 0; b--) { bits.push((head[i] >>> b) & 1); }
@@ -289,13 +306,13 @@
                 cells[free[j + 40 * k]] = bits[j] ? 0 : 7;
             }
         }
-        /* 数据：交织流 MSB 在前，每格 3 bit */
+        /* 数据：交织流 MSB 在前，每格 bpc 位（8 色 3 bit，4 色 2 bit 再查表） */
         var stream = rsBlocks(payload);
         var totalBits = stream.length * 8;
         var bitpos = 0;
         for (i = HEADER_CELLS; i < free.length; i++) {
             var val = 0;
-            for (var t = 0; t < 3; t++) {
+            for (var t = 0; t < bpc; t++) {
                 var bit = 0;
                 if (bitpos < totalBits) {
                     bit = (stream[bitpos >> 3] >>> (7 - (bitpos & 7))) & 1;
@@ -303,7 +320,7 @@
                 val = (val << 1) | bit;
                 bitpos++;
             }
-            cells[free[i]] = val;
+            cells[free[i]] = bpc === 2 ? PALETTE4[val] : val;
         }
         return { n: N, cells: cells };
     }
@@ -311,6 +328,7 @@
     return {
         GRID_SIZES: GRID_SIZES,
         PALETTE_CSS: PALETTE_CSS,
+        PALETTE4: PALETTE4,
         QUIET: 2,
         capacity: capacity,
         rsEncode: rsEncode,

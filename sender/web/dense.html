@@ -6,7 +6,7 @@
 <title>VisionDrop 密集 8 色发送端</title>
 <style>
 body { font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
-       margin: 0; padding: 12px; background: #f4f4f4; color: #222; }
+       margin: 0; padding: 12px; background: #fff; color: #222; }
 h1 { font-size: 18px; margin: 0 0 10px 0; }
 .panel { background: #fff; border: 1px solid #ddd; padding: 10px;
          margin-bottom: 10px; }
@@ -14,8 +14,13 @@ h1 { font-size: 18px; margin: 0 0 10px 0; }
 label { margin-right: 4px; }
 select, input, button { font-size: 14px; padding: 3px 6px; }
 button { cursor: pointer; margin-right: 6px; }
-#qrwrap { text-align: center; background: #fff; border: 1px solid #ddd;
-          padding: 8px 0; }
+/* 播放区域纯白、无边框：符号外围的任何灰底或边线都可能被接收端当成边缘 */
+#qrwrap { text-align: center; background: #fff; padding: 8px 0; }
+#qrwrap canvas { display: block; margin: 0 auto; }
+#qrwrap.fs { width: 100%; height: 100%; padding: 0; margin: 0; }
+/* 全屏底衬默认是黑的，各家前缀分开写：一条规则里有不认识的选择器会整条作废 */
+#qrwrap::backdrop { background: #fff; }
+#qrwrap::-ms-backdrop { background: #fff; }
 #info td { padding: 2px 10px 2px 0; font-size: 13px; }
 #stats { font-size: 13px; color: #444; }
 #err { color: #b00020; }
@@ -32,7 +37,8 @@ button { cursor: pointer; margin-right: 6px; }
         <span id="err"></span>
     </div>
     <div class="row hint">
-        物理层 VD-D1：8 色格阵（每格 3 bit，RGB 立方体调色板），
+        物理层 VD-D1：8 色格阵（每格 3 bit，RGB 立方体调色板）；
+        8 色不稳时可切 4 色降级档（黑/青/品红/黄，每格 2 bit，色距大约 3 dB），
         载荷为标准 L2 帧。规约见 protocol/dense/DENSE.md。
     </div>
 </div>
@@ -49,12 +55,14 @@ button { cursor: pointer; margin-right: 6px; }
     <div class="row">
         <label for="tier">档位</label>
         <select id="tier"></select>
-        <label for="interval">间隔(ms)</label>
-        <input type="number" id="interval" value="150" min="16" step="1" style="width:70px">
-        <span class="hint">会自动量化成刷新周期的整数倍；填 16 即每个刷新周期换一帧</span>
+        <label for="interval">显示间隔</label>
+        <select id="interval"></select>
+        <label><input type="checkbox" id="autoslow" checked>掉帧自动降速</label>
+        <span class="hint">选项按实测刷新周期的整数倍给出；接收端 60fps 时推荐 3 周期（约 50 ms）</span>
     </div>
     <div class="row">
         <button id="btn_play">开始播放</button>
+        <button id="btn_fs">全屏播放</button>
         <button id="btn_reset">重置块序号</button>
         <button id="btn_dump">导出帧转储</button>
     </div>
@@ -80,7 +88,7 @@ button { cursor: pointer; margin-right: 6px; }
     var sess = null;
     var content = null;       /* 原始文件内容，换档要用它重建会话 */
     var fileName = "";
-    var tiers = [];           /* [{N, net, m, T, frames}] */
+    var tiers = [];           /* [{N, colors, net, m, T, frames}]，8 色档在前、4 色档在后 */
     var tierIdx = 0;
     var nextBlockId = 0;      /* 游标：仅在帧真正显示后推进 */
     var framesShown = 0;
@@ -100,7 +108,7 @@ button { cursor: pointer; margin-right: 6px; }
             var st = JSON.parse(raw);
             nextBlockId = st.nextBlockId % 4294967296 || 0;
             framesShown = st.framesShown || 0;
-            if (st.intervalMs >= 16) { $("interval").value = st.intervalMs; }
+            if (st.intervalMs >= 4) { targetMs = st.intervalMs; }
         } catch (e) { /* localStorage 不可用时静默跳过 */ }
     }
 
@@ -109,7 +117,7 @@ button { cursor: pointer; margin-right: 6px; }
             window.localStorage.setItem(stateKey(), JSON.stringify({
                 nextBlockId: nextBlockId,
                 framesShown: framesShown,
-                intervalMs: parseInt($("interval").value, 10) || 150
+                intervalMs: targetMs
             }));
         } catch (e) { /* 同上 */ }
     }
@@ -129,17 +137,22 @@ button { cursor: pointer; margin-right: 6px; }
      * 一轮所需帧数 N=80 降 20%、N=96 降 11%、N=112 降 10%。
      * 代价是 T 变了 sessionId 就变，因此换档等于换会话，游标要重来——
      * 这在换档本就是「重新开始一轮」的语义下是可接受的。
+     *
+     * 4 色降级档（每格 2 bit，只用黑/青/品红/黄）排在 8 色五档之后：
+     * 8 色在当前屏幕、摄像头、环境光下不稳时往下切。档位下标的前段仍是
+     * 8 色档，默认档与本地记住的旧下标语义不变。
      */
     function buildTiers(streamLen) {
         var out = [];
-        for (var i = 0; i < VDD.GRID_SIZES.length; i++) {
-            var N = VDD.GRID_SIZES[i];
-            var net = VDD.capacity(N).net;
+        for (var i = 0; i < VDD.GRID_SIZES.length * 2; i++) {
+            var N = VDD.GRID_SIZES[i % VDD.GRID_SIZES.length];
+            var colors = i < VDD.GRID_SIZES.length ? 8 : 4;
+            var net = VDD.capacity(N, colors).net;
             var p = VDP.pickParams(streamLen, net);
             var m = Math.min(255, Math.floor((net - 20) / p.T));
             if (m < 1) { continue; }
             var eps = p.codec === VDP.CODEC_RLNC ? VDP.epsRlnc(p.K) : VDP.epsLt(p.K);
-            out.push({ N: N, net: net, m: m, T: p.T,
+            out.push({ N: N, colors: colors, net: net, m: m, T: p.T,
                        frames: Math.ceil(Math.ceil(p.K * (1 + eps)) / m) });
         }
         return out;
@@ -164,6 +177,7 @@ button { cursor: pointer; margin-right: 6px; }
         nextBlockId = 0;
         framesShown = 0;
         loadState();
+        fillIntervalSelect();
         showSession();
         return true;
     }
@@ -195,6 +209,9 @@ button { cursor: pointer; margin-right: 6px; }
             " ｜ 显示间隔 " + h.hold.toFixed(1) + " ms（" + h.k + " × " +
             h.P.toFixed(1) + " ms 刷新周期）" +
             (fps > 0 ? " ｜ 实测 " + fps.toFixed(1) + " fps" : "") +
+            (holdK > baseK ? " ｜ <span class=\"warn\">掉帧降速至 " + holdK +
+                             " 周期（设定 " + baseK + "）</span>" : "") +
+            (missedTotal > 0 ? " ｜ 掉帧 " + missedTotal : "") +
             (starved > 0 ? " ｜ <span class=\"warn\">欠载保帧 " + starved +
                            " 次（间隔太激进或档位太重）</span>" : "");
     }
@@ -207,7 +224,7 @@ button { cursor: pointer; margin-right: 6px; }
             var opt = document.createElement("option");
             opt.value = i;
             var fill = Math.round(100 * (20 + t.m * t.T) / t.net);
-            opt.text = "档" + (i + 1) + "  " + t.N + "格  每帧 " + t.m +
+            opt.text = "档" + (i + 1) + "  " + t.colors + "色 " + t.N + "格  每帧 " + t.m +
                 " 块  一轮 " + t.frames + " 帧  填充 " + fill + "%";
             sel.appendChild(opt);
         }
@@ -260,9 +277,11 @@ button { cursor: pointer; margin-right: 6px; }
     function computeGeom() {
         var n = tiers[tierIdx].N;
         var dim = n + MARGIN * 2;
+        /* 全屏时整块屏幕都是播放区，静区已含在 dim 里，不再额外留边 */
+        var fs = fsElement() ? 0 : 1;
         var avail = Math.min(
-            (window.innerWidth || document.documentElement.clientWidth) - 40,
-            (window.innerHeight || document.documentElement.clientHeight) - 60);
+            (window.innerWidth || document.documentElement.clientWidth) - 40 * fs,
+            (window.innerHeight || document.documentElement.clientHeight) - 60 * fs);
         if (avail < 100) { avail = 100; }
         var px = Math.floor(avail / dim);
         if (px < 1) { px = 1; }
@@ -298,6 +317,10 @@ button { cursor: pointer; margin-right: 6px; }
         ctx.msImageSmoothingEnabled = false;
         ctx.fillStyle = "#fff";
         ctx.fillRect(0, 0, geo.size, geo.size);
+        /* 全屏时纵向居中；非全屏清掉 */
+        var vh = window.innerHeight || document.documentElement.clientHeight;
+        canvas.style.marginTop = fsElement()
+            ? Math.max(0, Math.floor((vh - geo.size) / 2)) + "px" : "";
 
         slots = [];
         for (var i = 0; i < RING_CAP; i++) { slots.push(makeSlot(geo.dim)); }
@@ -310,7 +333,7 @@ button { cursor: pointer; margin-right: 6px; }
         if (!geo || qCount >= RING_CAP) { return false; }
         var t = tiers[tierIdx];
         var frame = sess.encodeFrame(encodeBlockId, t.m);
-        var sym = VDD.encode(frame, t.N);
+        var sym = VDD.encode(frame, t.N, t.colors);
         var slot = slots[qTail];
         var cells = sym.cells, n = sym.n, dim = slot.dim, u32 = slot.u32;
         for (var r = 0; r < n; r++) {
@@ -350,20 +373,69 @@ button { cursor: pointer; margin-right: 6px; }
     var starved = 0;          /* 缓冲欠载导致的保帧次数 */
     var lastStatsTs = 0, lastSaveTs = 0;
     var presentTs = [];       /* 最近若干次呈现时刻，用来报实测 fps */
+    var targetMs = 50;        /* 用户意图（毫秒），刷新周期变了据此重新对齐 */
+    var optP = 16.7;          /* 当前下拉选项所依据的刷新周期 */
+    var baseK = 3;            /* 用户所选的刷新周期倍数，降速只在其之上加 */
+    var holdK = 3;            /* 实际生效的倍数 */
+    var missedTotal = 0;      /* 累计掉帧（rAF 间隔推算） */
+    var winTicks = 0, winMissed = 0, winClean = 0;   /* 降速结算窗口 */
 
     /*
-     * 把用户填的间隔量化成刷新周期的整数倍。
+     * 显示间隔只能是刷新周期的整数倍。
      *
      * setTimeout 的间隔和刷新周期没有公约数，换帧点在刷新周期内随机漂移，
      * 每帧的实际显示时长在 ±1 个刷新周期内跳动——接收端看到的稳定窗口是抖的。
      * 对齐之后每帧显示时长恒定，"曝光落在稳定期"的概率才是可算的。
+     * 既然任意毫秒数都会被量化，不如直接把量化后的结果摆出来给用户选。
      */
     function currentHold() {
-        var P = vsyncP || 16.7;
-        var want = parseInt($("interval").value, 10) || 150;
-        var k = Math.round(want / P);
-        if (k < 1) { k = 1; }
-        return { P: P, k: k, hold: k * P };
+        var P = vsyncP || optP;
+        return { P: P, k: holdK, hold: holdK * P };
+    }
+
+    /* 按刷新周期 optP 重建间隔选项（上限约 500 ms），选中最接近 targetMs 的一项 */
+    function fillIntervalSelect() {
+        var sel = $("interval");
+        var best = 1, bestDiff = Infinity;
+        sel.options.length = 0;
+        for (var k = 1; k <= 60 && (k === 1 || k * optP <= 500); k++) {
+            var opt = document.createElement("option");
+            opt.value = k;
+            opt.text = k + " 周期 ≈ " + (k * optP).toFixed(1) + " ms / " +
+                       (1000 / (k * optP)).toFixed(1) + " fps";
+            sel.appendChild(opt);
+            var diff = Math.abs(k * optP - targetMs);
+            if (diff < bestDiff) { bestDiff = diff; best = k; }
+        }
+        sel.selectedIndex = best - 1;
+        baseK = best;
+        holdK = best;           /* 选项重建即清掉降速累积 */
+        winTicks = 0; winMissed = 0; winClean = 0;
+    }
+
+    /*
+     * 掉帧自动降速。rAF 间隔超过一个周期即说明丢了屏幕帧——设备产不出这个
+     * 换帧节奏，与其让合成器丢掉半帧，不如每帧多停一个周期。
+     * 每 120 次回调结算一次：掉帧超过 9 个就 holdK + 1；连续两个干净窗口回落 1，
+     * 直到回到用户设定值。
+     */
+    function backoff(d) {
+        /* 切后台时 rAF 整个停摆，回来的第一个间隔可能是几秒：
+           那是标签页挂起，不是渲染跟不上，不能据此降速 */
+        if (!(vsyncP > 0) || d > vsyncP * 8) { return; }
+        var lost = Math.round(d / vsyncP) - 1;
+        if (lost > 0) { missedTotal += lost; winMissed += lost; }
+        winTicks++;
+        if (winTicks < 120) { return; }
+        if (winMissed > 9 && $("autoslow").checked) {
+            if (holdK < baseK * 4) { holdK++; }
+            winClean = 0;
+        } else if (winMissed === 0) {
+            winClean++;
+            if (winClean >= 2 && holdK > baseK) { holdK--; winClean = 0; }
+        }
+        winTicks = 0;
+        winMissed = 0;
     }
 
     function frameLoop(ts) {
@@ -385,7 +457,13 @@ button { cursor: pointer; margin-right: 6px; }
                     if (rafDeltas[i] < mn) { mn = rafDeltas[i]; }
                 }
                 vsyncP = mn;
+                /* 实测周期与选项所依据的偏差超过 15% 才重建，避免抖动反复刷新列表 */
+                if (rafDeltas.length >= 20 && Math.abs(mn - optP) / optP > 0.15) {
+                    optP = mn;
+                    fillIntervalSelect();
+                }
             }
+            backoff(d);
         }
         lastRafTs = ts;
 
@@ -430,6 +508,8 @@ button { cursor: pointer; margin-right: 6px; }
         lastRafTs = 0; lastPresentTs = 0; vsyncP = 0; rafDeltas = [];
         starved = 0; presentTs = [];
         lastStatsTs = 0; lastSaveTs = 0;
+        holdK = baseK; missedTotal = 0;
+        winTicks = 0; winMissed = 0; winClean = 0;
         try {
             rebuildPipeline();
             while (qCount < RING_CAP) { if (!produceFrame()) { break; } }
@@ -518,7 +598,10 @@ button { cursor: pointer; margin-right: 6px; }
             var last = parseInt(window.localStorage
                 ? window.localStorage.getItem("vdweb.dense.lastTier") : "", 10);
             if (!(last >= 0 && last < tiers.length)) {
-                last = Math.floor((tiers.length - 1) / 2);
+                /* 默认取 8 色档的中间一档，与加入 4 色档之前一致 */
+                var n8 = 0;
+                for (var k = 0; k < tiers.length; k++) { if (tiers[k].colors === 8) { n8++; } }
+                last = Math.floor(((n8 || tiers.length) - 1) / 2);
             }
             if (!applyTier(last)) { return; }
             $("tier").selectedIndex = tierIdx;
@@ -546,21 +629,54 @@ button { cursor: pointer; margin-right: 6px; }
      * 只会把预渲染预算吃光，反而制造欠载。
      */
     var resizeTimer = null;
+    function relayout() {
+        resizeTimer = null;
+        if (!playing) { return; }
+        try {
+            rebuildPipeline();
+            while (qCount < RING_CAP) { if (!produceFrame()) { break; } }
+        } catch (e) {
+            stop();
+            errEl.innerHTML = "编码出错: " + e.message;
+        }
+    }
     window.addEventListener("resize", function () {
         if (!sess || !playing) { return; }
         if (resizeTimer) { window.clearTimeout(resizeTimer); }
-        resizeTimer = window.setTimeout(function () {
-            resizeTimer = null;
-            if (!playing) { return; }
-            try {
-                rebuildPipeline();
-                while (qCount < RING_CAP) { if (!produceFrame()) { break; } }
-            } catch (e) {
-                stop();
-                errEl.innerHTML = "编码出错: " + e.message;
-            }
-        }, 200);
+        resizeTimer = window.setTimeout(relayout, 200);
     });
+
+    /*
+     * 全屏播放：只让符号区域进入全屏，纯白无边框，ESC 由浏览器退出。
+     * 进出全屏都立即按新视口重建布局；随后的 resize 还会防抖再建一次，
+     * 兜住个别浏览器在 fullscreenchange 时视口尺寸尚未更新的情况。
+     * IE10 等没有 Fullscreen API 的浏览器直接隐藏按钮。
+     */
+    var wrapEl = $("qrwrap");
+    var reqFs = wrapEl.requestFullscreen || wrapEl.webkitRequestFullscreen ||
+                wrapEl.mozRequestFullScreen || wrapEl.msRequestFullscreen;
+    function fsElement() {
+        return document.fullscreenElement || document.webkitFullscreenElement ||
+               document.mozFullScreenElement || document.msFullscreenElement || null;
+    }
+    function onFsChange() {
+        wrapEl.className = fsElement() === wrapEl ? "fs" : "";
+        relayout();
+    }
+    if (reqFs) {
+        var fsEvents = ["fullscreenchange", "webkitfullscreenchange",
+                        "mozfullscreenchange", "MSFullscreenChange"];
+        for (var fi = 0; fi < fsEvents.length; fi++) {
+            document.addEventListener(fsEvents[fi], onFsChange);
+        }
+        $("btn_fs").addEventListener("click", function () {
+            if (!sess) { return; }
+            play();               /* 先让播放区可见，全屏请求必须在这次点击里发出 */
+            reqFs.call(wrapEl);
+        });
+    } else {
+        $("btn_fs").style.display = "none";
+    }
 
     $("btn_dump").addEventListener("click", exportDump);
 
@@ -575,7 +691,16 @@ button { cursor: pointer; margin-right: 6px; }
     });
 
     $("interval").addEventListener("change", function () {
+        baseK = parseInt(this.value, 10) || 1;
+        holdK = baseK;            /* 手动改间隔时清掉降速累积 */
+        targetMs = baseK * optP;
+        winTicks = 0; winMissed = 0; winClean = 0;
         saveState();
+        refreshStats();
+    });
+
+    $("autoslow").addEventListener("change", function () {
+        if (!this.checked) { holdK = baseK; }
         refreshStats();
     });
 })();

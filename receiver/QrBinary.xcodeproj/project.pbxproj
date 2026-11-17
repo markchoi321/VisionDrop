@@ -29,9 +29,22 @@
 		572642CD2F4A045D00E5DE0F /* QrBinaryUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = QrBinaryUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		57A0FE102F4A0A0100E5DE0F /* Exceptions for "QrBinary" folder in "QrBinary" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			additionalCompilerFlagsByRelativePath = {
+				"DenseL1/vd_dense_core.c" = "-O2";
+			};
+			target = 572642B52F4A045B00E5DE0F /* QrBinary */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		572642B82F4A045B00E5DE0F /* QrBinary */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				57A0FE102F4A0A0100E5DE0F /* Exceptions for "QrBinary" folder in "QrBinary" target */,
+			);
 			path = QrBinary;
 			sourceTree = "<group>";
 		};

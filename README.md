@@ -13,7 +13,6 @@ VisionDrop/
 │   ├── vectors/         L2–L5 测试向量，两端各自比对
 │   └── dense/           密集 8 色 L1（VD-D1）：规约 + 参考实现 + 向量 + 金图像
 ├── sender/              发送端
-│   ├── java/            L2–L5 协议层交叉校验模块（不是可运行的发送端）
 │   └── web/             纯原生 HTML+JS 版（零依赖，兼容 IE10+ / Android 4+）
 ├── receiver/            接收端（iOS，SwiftUI）
 └── README.md
@@ -29,7 +28,7 @@ VisionDrop/
 | L4 流 | 元数据头 + 可选 raw deflate + 文件内容 |
 | L3 编码 | 喷泉码，按文件大小分档选用解方程（RLNC）或剥洋葱（LT） |
 | L2 帧 | 20 字节二进制帧头 + m 个无头编码块 |
-| L1 物理 | 密集 8 色色块码（VD-D1）生成/识别，每格 3 bit，档位 N=64–128 |
+| L1 物理 | 密集色块码（VD-D1）生成/识别：8 色每格 3 bit，另有 4 色降级档（黑/青/品红/黄，每格 2 bit，色距约 +3 dB）；档位 N=64–128，两种色数各五档 |
 
 三个要点：
 
@@ -54,15 +53,6 @@ N=64–128，N=128 档单符号净载荷 5087 字节。每档各自选块大小 
 
 详见 [sender/web/README.md](sender/web/README.md)。
 
-### 协议层交叉校验 sender/java
-
-**不是可运行的发送端。** 二维码物理层迁出后，这里只保留一份独立的 L2–L5 协议实现与
-向量比对（Swing 界面、播放状态持久化与 ZXing 依赖已删除）。留着的理由是
-`protocol/vectors/` 需要多个独立实现互验：L2–L5 与物理层无关，色块码路径原样沿用同一套
-语义，少一个独立实现就少一层保障，而成本只是一个不再运行的 Maven 模块。
-
-详见 [sender/java/README.md](sender/java/README.md)。
-
 ### 接收端 receiver
 
 SwiftUI 的 iOS 应用。摄像头连续扫描，多会话并行维护，进度以二进制 `.vdpg` 格式自动落盘并在启动时恢复。
@@ -79,10 +69,9 @@ SwiftUI 的 iOS 应用。摄像头连续扫描，多会话并行维护，进度�
 
 ```bash
 python3 protocol/refimpl.py check                      # 参考实现自检
-mvn -o -f sender/java/pom.xml test                     # Java 协议层交叉校验
 node sender/web/test/run-vectors.js                    # Web 发送端 L2–L5 向量比对
 node sender/web/test/run-dense-vectors.js              # Web 发送端 L1（VD-D1）向量比对
-python3 protocol/dense/dense_refimpl.py check          # 密集 8 色参考实现自检
+python3 protocol/dense/dense_refimpl.py check          # 密集色块码参考实现自检（8 色与 4 色）
 xcodebuild test -project receiver/QrBinary.xcodeproj \
   -scheme QrBinary -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
@@ -106,7 +95,7 @@ python3 protocol/crosscheck.py <dump> --sha <原始文件sha256>
 
 本仓库由两个独立仓库合并而来，两侧历史完整保留，提交日期为原值：
 
-- 发送端源自 `markchoi321/Binary2QrCode`，历史路径已重写至 `sender/java/`
+- 发送端源自 `markchoi321/Binary2QrCode`，历史路径已重写至 `sender/java/`（该目录已删除，历史仍可在 git 中查到）
 - 接收端源自 `markchoi321/QrBinary`，历史路径已重写至 `receiver/`
 
 合并前的基线见 tag `v0.1.0-baseline`。

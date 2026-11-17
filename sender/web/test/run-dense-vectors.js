@@ -47,14 +47,16 @@ rawLines("dense_header.txt").forEach(function (l) {
 });
 console.log("dense_header.txt 通过");
 
-/* 2. 容量 */
-rawLines("dense_capacity.txt").forEach(function (l) {
-    var p = l.split(" ").map(Number);
-    var c = VDD.capacity(p[0]);
-    ok(c.free === p[1] && c.dataCells === p[2] && c.capBytes === p[3] && c.net === p[4],
-        "dense_capacity N=" + p[0] + " 实得 " + JSON.stringify(c));
+/* 2. 容量（8 色与 4 色两张表） */
+[["dense_capacity.txt", 8], ["dense_capacity4.txt", 4]].forEach(function (f) {
+    rawLines(f[0]).forEach(function (l) {
+        var p = l.split(" ").map(Number);
+        var c = VDD.capacity(p[0], f[1]);
+        ok(c.free === p[1] && c.dataCells === p[2] && c.capBytes === p[3] && c.net === p[4],
+            f[0] + " N=" + p[0] + " 实得 " + JSON.stringify(c));
+    });
+    console.log(f[0] + " 通过");
 });
-console.log("dense_capacity.txt 通过");
 
 /* 3. RS */
 rawLines("dense_rs.txt").forEach(function (l) {
@@ -64,19 +66,21 @@ rawLines("dense_rs.txt").forEach(function (l) {
 });
 console.log("dense_rs.txt 通过");
 
-/* 4. 整符号 */
-var symLines = rawLines("dense_symbol.txt");
-for (var i = 0; i + 1 < symLines.length; i += 2) {
-    var p = symLines[i].split(" ");
-    var N = +p[0];
-    var payload = fromHex(p[2]);
-    ok(payload.length === +p[1], "dense_symbol 载荷长度");
-    var sym = VDD.encode(payload, N);
-    var got = "";
-    for (var j = 0; j < sym.cells.length; j++) { got += sym.cells[j]; }
-    ok(got === symLines[i + 1], "dense_symbol N=" + N + " 格值不一致");
-}
-console.log("dense_symbol.txt 通过");
+/* 4. 整符号（8 色与 4 色） */
+[["dense_symbol.txt", 8], ["dense_symbol4.txt", 4]].forEach(function (f) {
+    var symLines = rawLines(f[0]);
+    for (var i = 0; i + 1 < symLines.length; i += 2) {
+        var p = symLines[i].split(" ");
+        var N = +p[0];
+        var payload = fromHex(p[2]);
+        ok(payload.length === +p[1], f[0] + " 载荷长度");
+        var sym = VDD.encode(payload, N, f[1]);
+        var got = "";
+        for (var j = 0; j < sym.cells.length; j++) { got += sym.cells[j]; }
+        ok(got === symLines[i + 1], f[0] + " N=" + N + " 格值不一致");
+    }
+    console.log(f[0] + " 通过");
+});
 
 console.log("\n共 " + checks + " 项检查，失败 " + failures + " 项");
 process.exit(failures === 0 ? 0 : 1);

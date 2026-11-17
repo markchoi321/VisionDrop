@@ -57,14 +57,23 @@ final class DenseDecoder {
     private var lock = vdd_lock()
     private var frameBuf = [UInt8](repeating: 0, count: 8192)
 
+    /// 上一个成功帧的字节。C 核心判出「与上一成功帧同一符号」（VDD_DUPLICATE）
+    /// 时不做全采样与纠错，也不写输出缓冲，这里原样交还上一帧的字节。
+    private var lastFrame: Data?
+
+    /// 最近一次 decode 返回的字节是否来自重复帧早退（未做全采样与纠错）。
+    /// 返回值本身与完整解码完全相同，调用方不处理也不会出错；遥测想区分
+    /// 「C 层判重」与「解出后按哈希去重」时读它。
+    private(set) var lastWasDuplicate = false
+
     /// 当前是否处于跨帧跟踪锁定态（只在四角小窗内精定位）。
     /// 遥测日志要区分「锁定态下的失败」与「全图搜索下的失败」——前者多半是
     /// 信噪比问题，后者更可能是取景问题。
     var isTracking: Bool { lock.valid != 0 }
 
-    /// 该 N 档的净载荷上限（字节），非法 N 返回 0
-    static func netCapacity(grid n: Int32) -> Int32 {
-        vdd_net_capacity(n)
+    /// 该 N 档的净载荷上限（字节），非法 N 返回 0。colors 取 8（缺省）或 4（降级档）
+    static func netCapacity(grid n: Int32, colors: Int32 = 8) -> Int32 {
+        vdd_net_capacity_colors(n, colors)
     }
 
     /// RS errata 随机回归（调试用）
@@ -77,6 +86,8 @@ final class DenseDecoder {
         lock.valid = 0
         lock.grid = 0
         lock.beta = 0
+        lock.dup_n = 0
+        lastFrame = nil
     }
 
     /// 从 BGRA CVPixelBuffer 解一帧。成功返回 L2 帧字节。
@@ -141,6 +152,7 @@ final class DenseDecoder {
          * 只认 VDD_ERR_RS。信噪比过低的帧走 VDD_ERR_SIGNAL，那类帧是屏幕换帧
          * 过渡期抓到的，数据区被新旧两帧混合污染，换个定位起点结果一样，
          * 重试纯属白烧——4K 那一轮 11 个失败帧里有 5 个属于这一类。
+         * VDD_DUPLICATE 同样不重试，它不是失败。
          */
         if ret == VDD_ERR_RS && lock.valid != 0 {
             lock.wide = 1
@@ -150,9 +162,23 @@ final class DenseDecoder {
         }
         /* 失败时 diag 也带回了走得最远那个候选的测量值，现场排查要靠它 */
         diagnostics = diag
+        /*
+         * 重复帧不是失败：同一屏幕帧被连续扫到多次是常态（真机 N=112 遥测里
+         * 51% 的成功帧是重复）。C 核心只采了约 1/16 的格就认出来了，这里交还
+         * 上一帧的字节，对调用方而言与完整解出一次完全等价——计入成功、不触发
+         * 重试、照常走哈希去重。lastFrame 理论上不会为空（C 侧只有成功过才有
+         * 比对记录），万一为空按纠错失败处理，不编造数据。
+         */
+        lastWasDuplicate = ret == VDD_DUPLICATE
+        if lastWasDuplicate {
+            guard let prev = lastFrame else { throw Failure.rsUncorrectable }
+            return prev
+        }
         if ret < 0 {
             throw Failure(rawValue: ret) ?? .badArgs
         }
-        return Data(frameBuf[0..<Int(ret)])
+        let frame = Data(frameBuf[0..<Int(ret)])
+        lastFrame = frame
+        return frame
     }
 }

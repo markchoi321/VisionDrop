@@ -34,6 +34,21 @@ QUIET = 2                                    # 静区（格）
 PALETTE = [(0, 0, 0), (0, 0, 255), (0, 255, 0), (0, 255, 255),
            (255, 0, 0), (255, 0, 255), (255, 255, 0), (255, 255, 255)]
 
+# 调制方式（版本字节低 2 位）：0 = 8 色（每格 3 bit），1 = 4 色（每格 2 bit）
+MOD_8 = 0
+MOD_4 = 1
+COLOR_COUNTS = (8, 4)
+# 4 色档：2 bit 值 d -> 格值 v，取 {黑, 青, 品红, 黄}（立方体上互不相邻的四角）。
+# v 的三位 = (d 高位, d 低位, 二者异或)。黑-黄、青-品红为 2 bit 对。
+PALETTE4 = [0, 3, 5, 6]
+INV4 = {v: d for d, v in enumerate(PALETTE4)}
+
+
+def bits_per_cell(colors):
+    if colors not in COLOR_COUNTS:
+        raise ValueError("色数只能是 8 或 4: %r" % (colors,))
+    return 3 if colors == 8 else 2
+
 # ---------------------------------------------------------------- GF(256)
 
 GF_EXP = [0] * 512
@@ -193,10 +208,21 @@ def crc8(data):
     return c
 
 
-def build_header(payload_len):
-    head = bytes([MAGIC, VERSION << 4,
+def build_header(payload_len, colors=8):
+    mod = MOD_4 if bits_per_cell(colors) == 2 else MOD_8
+    head = bytes([MAGIC, (VERSION << 4) | mod,
                   (payload_len >> 8) & 0xFF, payload_len & 0xFF])
     return head + bytes([crc8(head)])
+
+
+def parse_header(head):
+    """5 字节头部 -> (payloadLen, 色数)，校验失败抛异常。"""
+    if head[0] != MAGIC or (head[1] >> 4) != VERSION or crc8(head[:4]) != head[4]:
+        raise ValueError("头部校验失败")
+    if head[1] & 0x0C or (head[1] & 0x03) not in (MOD_8, MOD_4):
+        raise ValueError("未知调制方式 0x%02x" % head[1])
+    colors = 4 if (head[1] & 0x03) == MOD_4 else 8
+    return (head[2] << 8) | head[3], colors
 
 
 # ---------------------------------------------------------------- 结构
@@ -243,11 +269,11 @@ def free_cells(N):
     return [(i // N, i % N) for i in range(N * N) if not fn[i]]
 
 
-def capacity(N):
+def capacity(N, colors=8):
     """返回 (free, dataCells, capBytes, netMax)。"""
     free = len(free_cells(N))
     data_cells = free - HEADER_CELLS
-    cap_bytes = data_cells * 3 // 8
+    cap_bytes = data_cells * bits_per_cell(colors) // 8
     net = 0
     p = cap_bytes
     while p > 0:
@@ -285,9 +311,10 @@ def rs_blocks(payload):
     return bytes(out)
 
 
-def encode_symbol(payload, N):
-    """载荷 -> N*N 格值数组（行优先，值 0-7）。"""
-    _, _, _, net = capacity(N)
+def encode_symbol(payload, N, colors=8):
+    """载荷 -> N*N 格值数组（行优先，值 0-7）。4 色档的数据格只出现 PALETTE4。"""
+    bpc = bits_per_cell(colors)
+    _, _, _, net = capacity(N, colors)
     if len(payload) > net:
         raise ValueError("载荷超出容量: N=%d len=%d net=%d" % (N, len(payload), net))
     cells = [7] * (N * N)                    # 默认白（角部块的分隔带即白）
@@ -321,7 +348,7 @@ def encode_symbol(payload, N):
     cells_free = free_cells(N)
     header_cells = cells_free[:HEADER_CELLS]
     data_cells = cells_free[HEADER_CELLS:]
-    head = build_header(len(payload))
+    head = build_header(len(payload), colors)
     bits = []
     for byte in head:
         for b in range(7, -1, -1):
@@ -335,20 +362,23 @@ def encode_symbol(payload, N):
     total_bits = len(stream) * 8
     for (r, c) in data_cells:
         v = 0
-        for _ in range(3):
+        for _ in range(bpc):
             bit = 0
             if bitpos < total_bits:
                 bit = (stream[bitpos >> 3] >> (7 - (bitpos & 7))) & 1
             v = (v << 1) | bit
             bitpos += 1
-        put(r, c, v)
+        put(r, c, PALETTE4[v] if bpc == 2 else v)
     return cells
 
 
 # ---------------------------------------------------------------- 矩阵解码
 
-def decode_cells(cells, N):
-    """从格值数组解回载荷（无图像环节），失败抛异常。"""
+def decode_cells(cells, N, cells4=None):
+    """从格值数组解回载荷（无图像环节），失败抛异常。
+
+    cells4 可选：每格在 4 色组内的判决（0-3），图像解码器给出；
+    缺省时按格值精确反查 PALETTE4（矩阵往返用）。"""
     cells_free = free_cells(N)
     header_cells = cells_free[:HEADER_CELLS]
     data_cells = cells_free[HEADER_CELLS:]
@@ -363,15 +393,21 @@ def decode_cells(cells, N):
     for j, b in enumerate(bits):
         if b:
             head[j >> 3] |= 0x80 >> (j & 7)
-    if head[0] != MAGIC or (head[1] >> 4) != VERSION or crc8(head[:4]) != head[4]:
-        raise ValueError("头部校验失败")
-    payload_len = (head[2] << 8) | head[3]
+    payload_len, colors = parse_header(head)
+    bpc = bits_per_cell(colors)
     stream_len = payload_len + RS_PARITY * ((payload_len + RS_DATA_MAX - 1) // RS_DATA_MAX)
-    raw = bytearray((len(data_cells) * 3 + 7) // 8)
+    raw = bytearray((len(data_cells) * bpc + 7) // 8)
     bitpos = 0
     for (r, c) in data_cells:
         v = cells[r * N + c]
-        for b in (2, 1, 0):
+        if bpc == 2:
+            if cells4 is not None:
+                v = cells4[r * N + c]
+            elif v in INV4:
+                v = INV4[v]
+            else:
+                raise ValueError("4 色档出现组外格值 %d" % v)
+        for b in range(bpc - 1, -1, -1):
             if (v >> b) & 1:
                 raw[bitpos >> 3] |= 0x80 >> (bitpos & 7)
             bitpos += 1
@@ -505,8 +541,12 @@ def barrel(img, k1, seed=1):
 
 
 def distort(img, gamma=(1.0, 1.0, 1.0), gain=(1.0, 1.0, 1.0),
-            noise=0, warp=0.0, seed=1):
-    """光度失真（逐通道 gamma / 增益 / 噪声）+ 轻度透视。全部确定性。"""
+            noise=0, warp=0.0, seed=1, xtalk=None, lift=0):
+    """光度失真（逐通道 gamma / 增益 / 噪声）+ 轻度透视。全部确定性。
+
+    xtalk：3x3 通道串扰矩阵（行 = 输出通道），模拟屏幕基色在相机传感器上的
+    交叉响应（真机实测绿基色在 R 通道读到 114）；lift：黑电平抬升（0-255），
+    模拟环境光洗白造成的低对比度。二者在 gamma/增益之前作用，缺省不启用。"""
     h, w = len(img), len(img[0])
     st = R.mix32(seed)
     # 透视：四角各自向内/外偏移 warp*min(h,w) 像素
@@ -531,6 +571,12 @@ def distort(img, gamma=(1.0, 1.0, 1.0), gain=(1.0, 1.0, 1.0),
         for x in range(w):
             sx, sy = apply_h(H, x, y)
             p = bilinear(img, sx, sy)
+            if xtalk is not None or lift:
+                q = p
+                if xtalk is not None:
+                    q = [sum(xtalk[ch][j] * p[j] for j in range(3)) for ch in range(3)]
+                p = tuple(int(max(0, min(255, lift + v * (255 - lift) / 255.0 + 0.5)))
+                          for v in q)
             st = R.xorshift32(st)
             n = ((st & 0xFFFF) / 65536.0 * 2 - 1) * noise
             row.append(tuple(
@@ -728,7 +774,10 @@ def decode_image(img, N):
                 (on if i & bit else off)[ch].append(p[ch])
     th = [(sum(on[ch]) / len(on[ch]) + sum(off[ch]) / len(off[ch])) / 2.0
           for ch in range(3)]
+    gap = [max(1.0, (sum(on[ch]) / len(on[ch]) - sum(off[ch]) / len(off[ch])) / 2.0)
+           for ch in range(3)]
     cells = [0] * (N * N)
+    cells4 = [0] * (N * N)
     for r in range(N):
         for c in range(N):
             p = samples[r][c]
@@ -736,7 +785,16 @@ def decode_image(img, N):
                 ((1 if p[1] > th[1] else 0) << 1) | \
                 (1 if p[2] > th[2] else 0)
             cells[r * N + c] = v
-    return decode_cells(cells, N)
+            # 4 色组内判决：归一化通道偏离与各组色的符号模式做相关，取最大
+            u = [(p[ch] - th[ch]) / gap[ch] for ch in range(3)]
+            best, bd = -1e9, 0
+            for d, g in enumerate(PALETTE4):
+                sc = sum(u[ch] if g & bit else -u[ch]
+                         for ch, bit in ((0, 4), (1, 2), (2, 1)))
+                if sc > best:
+                    best, bd = sc, d
+            cells4[r * N + c] = bd
+    return decode_cells(cells, N, cells4)
 
 
 # ---------------------------------------------------------------- 向量
@@ -774,6 +832,23 @@ def gen():
         lines.append("%d %d %s" % (N, plen, payload.hex()))
         lines.append("".join(str(v) for v in cells))
     _write("dense_symbol.txt", lines)
+
+    # 4 色档：单独成文件，8 色向量保持逐字节不变
+    lines = ["# VD-D1 4 色档容量表（每格 2 bit）",
+             "# 格式: <N> <free> <数据格数> <容量字节> <净载荷上限>"]
+    for N in GRID_SIZES:
+        free, dc, cap, net = capacity(N, 4)
+        lines.append("%d %d %d %d %d" % (N, free, dc, cap, net))
+    _write("dense_capacity4.txt", lines)
+
+    lines = ["# 4 色档整符号格值。第一行参数，第二行 N*N 个格值数字（数据格只含 0/3/5/6）",
+             "# 格式: <N> <payloadLen> <payload hex>"]
+    for N, plen, seed in ((64, 313, 5), (96, 1500, 9)):
+        payload = R._det_bytes(plen, seed)
+        cells = encode_symbol(payload, N, 4)
+        lines.append("%d %d %s" % (N, plen, payload.hex()))
+        lines.append("".join(str(v) for v in cells))
+    _write("dense_symbol4.txt", lines)
     print("向量已写入 %s" % VEC)
 
 
@@ -781,27 +856,45 @@ def gen():
 
 def check():
     print("=== 容量表 ===")
-    for N in GRID_SIZES:
-        free, dc, cap, net = capacity(N)
-        print("  N=%-4d 自由格 %-6d 容量 %-5dB 净载荷 %-5dB (QR V40 的 %.1f 倍)"
-              % (N, free, cap, net, net / 2953.0))
+    for colors in COLOR_COUNTS:
+        for N in GRID_SIZES:
+            free, dc, cap, net = capacity(N, colors)
+            print("  %d色 N=%-4d 自由格 %-6d 容量 %-5dB 净载荷 %-5dB (QR V40 的 %.1f 倍)"
+                  % (colors, N, free, cap, net, net / 2953.0))
 
     print("\n=== 矩阵往返 ===")
-    for N in GRID_SIZES:
-        _, _, _, net = capacity(N)
-        payload = R._det_bytes(net, N)
-        cells = encode_symbol(payload, N)
-        assert decode_cells(cells, N) == payload
-        print("  N=%d 满载荷 %dB 往返一致" % (N, net))
+    for colors in COLOR_COUNTS:
+        for N in GRID_SIZES:
+            _, _, _, net = capacity(N, colors)
+            payload = R._det_bytes(net, N)
+            cells = encode_symbol(payload, N, colors)
+            assert decode_cells(cells, N) == payload
+            print("  %d色 N=%d 满载荷 %dB 往返一致" % (colors, N, net))
+    # 4 色档数据格只能出现选定四色；头部调制位受 crc8 保护
+    cells = encode_symbol(R._det_bytes(500, 1), 64, 4)
+    data = [cells[r * 64 + c] for (r, c) in free_cells(64)[HEADER_CELLS:]]
+    assert set(data) <= set(PALETTE4)
+    h = bytearray(build_header(500, 4))
+    assert h[1] == 0x11
+    h[1] ^= 0x01
+    try:
+        parse_header(bytes(h))
+        assert False, "调制位翻转未被 crc8 拦下"
+    except ValueError:
+        pass
+    print("  4 色数据格只含 %s；调制位翻转被 crc8 拦下" % PALETTE4)
 
     print("\n=== 干净图像解码 ===")
     N = 96
-    _, _, _, net = capacity(N)
-    payload = R._det_bytes(net, 42)
-    cells = encode_symbol(payload, N)
-    img = render(cells, N, scale=8)
-    assert decode_image(img, N) == payload
-    print("  N=%d scale=8 一致" % N)
+    imgs = {}
+    for colors in COLOR_COUNTS:
+        _, _, _, net = capacity(N, colors)
+        payload = R._det_bytes(net, 42)
+        cells = encode_symbol(payload, N, colors)
+        img = render(cells, N, scale=8)
+        assert decode_image(img, N) == payload
+        imgs[colors] = (img, payload)
+        print("  %d色 N=%d scale=8 一致" % (colors, N))
 
     print("\n=== 失真图像解码 ===")
     cases = [
@@ -812,10 +905,12 @@ def check():
         ("组合失真", dict(gamma=(0.9, 1.15, 1.05), gain=(0.95, 1.02, 0.9),
                           noise=8, warp=0.006, seed=7)),
     ]
-    for label, kw in cases:
-        got = decode_image(distort(img, **kw), N)
-        assert got == payload, label
-        print("  %s 一致" % label)
+    for colors in COLOR_COUNTS:
+        img, payload = imgs[colors]
+        for label, kw in cases:
+            got = decode_image(distort(img, **kw), N)
+            assert got == payload, label
+            print("  %d色 %s 一致" % (colors, label))
 
     print("\n=== 协议栈端到端（L2 帧过密集 L1）===")
     content = R._det_bytes(20000, 2026)

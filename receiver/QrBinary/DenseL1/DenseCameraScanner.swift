@@ -215,7 +215,7 @@ private final class TelemetryLog: @unchecked Sendable {
         var metrics: SystemMetrics
     }
 
-    /// 条数上限。30fps 扫十分钟约 18000 条，再多也没有分析价值，
+    /// 条数上限。60fps 扫五分钟约 18000 条，再多也没有分析价值，
     /// 超出丢弃最旧的，避免长时间扫描把内存吃光。
     static let capacity = 20000
     /// 超限时一次丢一批而不是一条：Array.removeFirst(1) 是 O(n) 搬移，
@@ -257,6 +257,8 @@ private final class TelemetryLog: @unchecked Sendable {
         s += "frame_bytes,duplicate,tracking,exposure_locked,"
         s += "latency_ms,decode_ms,queue_ms,"
         s += "ms_find,ms_probe,ms_beta,ms_sample,ms_decide,ms_rs,ms_geom,ms_calib,"
+        /* 抽样早退与分区修正的观测量，用来复核坏帧（20%）与重复（25%）两道门限 */
+        s += "probe_cells,probe_low,probe_diff,zones,colors,"
         s += "cpu_pct,mem_mb,thermal\n"
         s.reserveCapacity(snapshot.count * 128)
         for r in snapshot {
@@ -274,6 +276,7 @@ private final class TelemetryLog: @unchecked Sendable {
             s += String(format: "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,",
                         d.ms_find, d.ms_probe, d.ms_beta, d.ms_sample,
                         d.ms_decide, d.ms_rs, d.ms_geom, d.ms_calib)
+            s += "\(d.probe_cells),\(d.probe_low),\(d.probe_diff),\(d.zones),\(d.colors),"
             s += String(format: "%.1f,%.1f,%d\n",
                         r.metrics.cpuPercent, r.metrics.memoryMB, r.metrics.thermal)
         }
@@ -475,14 +478,16 @@ final class DenseCameraScanner: NSObject, ObservableObject,
     private var recentHashes = Set<Int>()
 
     private static let lockAfterSuccesses = 3
-    /* 约 1 秒的连续失败即放开曝光与对焦锁：短于此会被偶发丢帧误触发 */
-    private static let unlockAfterFailures = 30
+    /* 采集帧率上限，见 configure */
+    nonisolated private static let captureFps = 60
+    /* 约 1 秒的连续失败（60fps）即放开曝光与对焦锁：短于此会被偶发丢帧误触发 */
+    private static let unlockAfterFailures = 60
     /*
      * 连续失败到这个数就先补一次单次对焦。真机上「突然一直解不出」多数是失焦，
      * 而不是取景不对；主动触发一次搜索比干等持续自动对焦自己察觉快得多。
      * 取值明显小于解锁阈值：先试成本低的（重新合焦），不行再退回全自动。
      */
-    private static let refocusAfterFailures = 8
+    private static let refocusAfterFailures = 16
 
     func start() {
         guard !isRunning else { return }
@@ -552,23 +557,38 @@ final class DenseCameraScanner: NSObject, ObservableObject,
 
         if (try? dev.lockForConfiguration()) != nil {
             /*
-             * 2K 走 .inputPriority，分辨率由 activeFormat 决定，这里自己挑一个。
-             * 判据只有两条：横向像素最接近目标，且该 format 支持到 20fps。
-             * 挑不到就什么都不做，session 会沿用它自己选的那个。
+             * 选 activeFormat。sessionPreset 隐含 30fps 上限，要上 60fps 只能自己挑 format
+             * （设了 activeFormat，session 会自动转成 .inputPriority）。
+             * - 候选只要 8-bit 4:2:0：10-bit HDR 格式会改动色调映射，调色板判决怕这个；
+             * - 尺寸：720p/1080p/4K 要求宽高与预设一致；2K 没有预设，取宽度最接近目标的
+             *   （1920...3200），预设设不上而退回 1080p 时按 1080p 挑；
+             * - 帧率：能到 60 的取最高帧率最低的一档，避开 120/240fps 慢动作格式
+             *   （多为像素合并，画质差）；都到不了 60 就取帧率最高的一档。
+             * 挑不到就什么都不做，session 沿用预设自己选的那个（通常 30fps）。
              */
-            if resolution == .qhd2K, session.sessionPreset == .inputPriority {
-                let target = resolution.targetWidth
-                let pick = dev.formats.filter { f in
-                    let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-                    guard d.width >= 1920 && d.width <= 3200 else { return false }
-                    return f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 20 }
-                }.min { a, b in
-                    let wa = Int(CMVideoFormatDescriptionGetDimensions(a.formatDescription).width)
-                    let wb = Int(CMVideoFormatDescriptionGetDimensions(b.formatDescription).width)
-                    return abs(wa - target) < abs(wb - target)
-                }
-                if let pick { dev.activeFormat = pick }
+            let fellBack = session.sessionPreset != preset
+            let target = fellBack ? 1920 : resolution.targetWidth
+            let anyHeight = resolution == .qhd2K && !fellBack
+            let fps = Double(Self.captureFps)
+            func width(_ f: AVCaptureDevice.Format) -> Int {
+                Int(CMVideoFormatDescriptionGetDimensions(f.formatDescription).width)
             }
+            func rateCost(_ f: AVCaptureDevice.Format) -> Double {
+                let r = f.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+                return r >= fps ? r - fps : 1000 - r
+            }
+            let pick = dev.formats.filter { f in
+                let sub = CMFormatDescriptionGetMediaSubType(f.formatDescription)
+                guard sub == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                        || sub == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange else { return false }
+                let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                if anyHeight { return d.width >= 1920 && d.width <= 3200 }
+                return Int(d.width) == target && Int(d.height) == target * 9 / 16
+            }.min { a, b in
+                let wa = abs(width(a) - target), wb = abs(width(b) - target)
+                return wa != wb ? wa < wb : rateCost(a) < rateCost(b)
+            }
+            if let pick { dev.activeFormat = pick }
             /*
              * 对焦策略：屏摄的被摄物是 20–60 cm 处的一块屏幕，且手持时距离一直在变。
              * - 限制对焦搜索范围到近距，避免来回拉到无穷远，合焦快得多；
@@ -591,17 +611,23 @@ final class DenseCameraScanner: NSObject, ObservableObject,
                 dev.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
             }
             /*
-             * 限帧。发送端屏幕以 10 fps 播放，采到 20 fps 就足够——每个屏幕帧
-             * 有两次机会避开换帧过渡期，再高纯属白烧。4K 一帧 BGRA 是 33 MB，
-             * 30 fps 与 20 fps 之间差着约 330 MB/s 的 ISP 输出与内存带宽，
-             * 而这些帧多半直接被 alwaysDiscardsLateVideoFrames 丢掉。
-             * 发热主要来自这里，不是解码。
+             * 帧率上限提到 60fps（格式到不了就取它的最高帧率）。早先限 20fps 的理由是
+             * 「解码慢」，但那是 -O0 Debug 构建测出的假象：C 核心 -O2 下 N=128 约 3.3ms。
+             * 真机遥测在 20fps / 发送端 83ms 时稳定为 ooowwooowwooo——每个符号恰好
+             * 只拿到一个干净帧，瓶颈在采集时间轴。60fps 配发送端 50ms（3 个 60Hz 刷新
+             * 周期）时，每个符号有 3 次采样，换帧过渡最多污染其中 2 帧。
+             *
+             * 只设 MinFrameDuration（帧率上限），MaxFrameDuration 复位到格式允许的最大值，
+             * 不把帧时长钉死：自动曝光期间帧时长可以浮动，采样相位随之漂移，不会与
+             * 发送端锁在一个坏相位上。先复位 Max 再设 Min：AVCaptureDevice 是设备级单例，
+             * 上一场扫描留下的值会一直活着。
              */
-            let wanted = CMTime(value: 1, timescale: 20)
-            if let range = dev.activeFormat.videoSupportedFrameRateRanges.first,
-               CMTimeCompare(wanted, range.minFrameDuration) >= 0,
-               CMTimeCompare(wanted, range.maxFrameDuration) <= 0 {
-                dev.activeVideoMinFrameDuration = wanted
+            if let range = dev.activeFormat.videoSupportedFrameRateRanges
+                .max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+                let wanted = CMTime(value: 1, timescale: CMTimeScale(Self.captureFps))
+                dev.activeVideoMaxFrameDuration = range.maxFrameDuration
+                dev.activeVideoMinFrameDuration =
+                    CMTimeMaximum(CMTimeMinimum(wanted, range.maxFrameDuration), range.minFrameDuration)
             }
             dev.unlockForConfiguration()
         }
@@ -627,11 +653,20 @@ final class DenseCameraScanner: NSObject, ObservableObject,
      * 表现为「只能在某个固定距离识别」。光度漂移是曝光与白平衡的问题，
      * 清晰度是对焦的问题，两者必须分开处置。
      *
-     * 同时把快门时间压到 1/120 s 以内、用 ISO 补偿：手持抖动带来的运动模糊
-     * 比噪声更致命，而调色板判决对整体明暗免疫——参考色和数据格在同一帧里
-     * 一起变暗，最近邻判决不受影响，所以宁可欠曝也要短曝光。
+     * 同时把快门时间压到 1/250 s 以内、用 ISO 补偿，超出 ISO 上限就接受欠曝。
+     * 两个理由：一是手持抖动的运动模糊比噪声更致命；二是曝光越短，跨在屏幕换帧
+     * 瞬间的那段时间窗越窄，过渡帧（VDD_ERR_SIGNAL）随之减少。调色板判决对整体
+     * 明暗免疫——参考色和数据格在同一帧里一起变暗，最近邻判决不受影响。
+     *
+     * 取舍：曝光一旦固定（custom 或 locked），自动曝光不再拉伸帧时长，相机实际上
+     * 按 MinFrameDuration 严格周期采样——MaxFrameDuration 留在格式最大值也挡不住。
+     * 此时与发送端的相位只靠两边晶振的微小偏差漂移，可视为锁定。我们保留 custom
+     * 曝光（短快门的收益是实打实的），把防线放在比例上：发送端每符号至少停留
+     * 3 个采集周期（60fps 下 50ms），过渡带（读出时间 + 曝光）最多跨 2 帧，
+     * 任何相位下每个符号都至少剩一个干净帧。2 个周期（33ms）在锁相下可能整符号
+     * 全废，不推荐。
      */
-    private static let maxExposureSeconds = 1.0 / 120.0
+    private static let maxExposureSeconds = 1.0 / 250.0
 
     private nonisolated func lockExposureAndWhiteBalance() {
         guard let dev = box.device, (try? dev.lockForConfiguration()) != nil else { return }
@@ -817,8 +852,8 @@ final class DenseCameraScanner: NSObject, ObservableObject,
         failStreak = 0
         lastFailure = ""
         detectedGrid = diag.grid
-        diagText = String(format: "%d格 %.1fpx/格 弓曲%.2f 分歧%d",
-                          diag.grid, diag.cell_px, diag.bow, diag.header_disagree)
+        diagText = String(format: "%d格 %d色 %.1fpx/格 弓曲%.2f 分歧%d",
+                          diag.grid, diag.colors, diag.cell_px, diag.bow, diag.header_disagree)
 
         // 解出若干帧后锁定曝光/白平衡，消除后续光度漂移
         successStreak += 1

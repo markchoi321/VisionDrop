@@ -2,9 +2,9 @@
  * VD-D1 密集彩色 L1 解码核心实现。规约：protocol/dense/DENSE.md。
  *
  * 流程（与 dense_refimpl.py 第 8 节一致）：
- *   亮度游程扫描(1:1:3:1:1) -> 四角单应性 -> 逐格双线性采样 ->
- *   定标条阈值 -> 三通道独立判决(带置信度) -> 头部多数表决 ->
- *   解交织 -> RS errata(错误+擦除)纠错 -> L2 帧字节
+ *   亮度游程扫描(1:1:3:1:1) -> 四角单应性 -> 定标条调色板 -> 头部多数表决 ->
+ *   抽样判决（坏帧 / 重复帧早退）-> 逐格采样 -> 整体偏移判决 ->
+ *   分区光照修正再判 -> 解交织 -> RS errata(错误+擦除)纠错 -> L2 帧字节
  */
 #include "vd_dense_core.h"
 
@@ -49,6 +49,15 @@ static _Thread_local double g_ms_geom, g_ms_calib;
 #define RS_ERAS_MAX (RS_PARITY - 8)
 #define MAGIC 0xD5
 #define VERSION 1
+/*
+ * 调制方式：头部版本字节低 2 位，0 = 8 色（每格 3 bit），1 = 4 色（每格 2 bit）。
+ * 4 色只用 {黑, 青, 品红, 黄} 四角，2 bit 值 d 对应格值 PALETTE4[d]。
+ * 判决时 8 色在 COLORS8 里找最近邻、返回格值；4 色在 PALETTE4 里找、返回 d，
+ * 两者都恰好是「要写进位流的那几位」。
+ */
+#define MOD_4 1
+static const int COLORS8[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+static const int PALETTE4[4] = { 0, 3, 5, 6 };
 #define N_MAX 128
 #define MAX_CAND 1024           /* 定位图形候选上限 */
 #define MAX_GROUP 256
@@ -398,9 +407,13 @@ static int free_cells_count(int n) {
 }
 
 int vdd_net_capacity(int n_grid) {
-    if (!is_valid_grid(n_grid)) return 0;
+    return vdd_net_capacity_colors(n_grid, 8);
+}
+
+int vdd_net_capacity_colors(int n_grid, int colors) {
+    if (!is_valid_grid(n_grid) || (colors != 8 && colors != 4)) return 0;
     int fr = free_cells_count(n_grid);
-    int cap = (fr - HEADER_CELLS) * 3 / 8;
+    int cap = (fr - HEADER_CELLS) * (colors == 4 ? 2 : 3) / 8;
     for (int p = cap; p > 0; p--) {
         int nb = (p + RS_DATA_MAX - 1) / RS_DATA_MAX;
         if (p + RS_PARITY * nb <= cap) return p;
@@ -448,14 +461,18 @@ static void sample_bilinear(const vdd_image *img, double x, double y, double out
     int x1 = x0 + 1 < w ? x0 + 1 : x0;
     int y1 = y0 + 1 < h ? y0 + 1 : y0;
     double fx = x - x0, fy = y - y0;
-    uint8_t p00[3], p01[3], p10[3], p11[3];
-    px_rgb(img, x0, y0, p00);
-    px_rgb(img, x1, y0, p01);
-    px_rgb(img, x0, y1, p10);
-    px_rgb(img, x1, y1, p11);
+    /* 热路径：直接取四个像素的指针，不逐像素走 px_rgb 的格式分支 */
+    const size_t bpp = img->is_bgra ? 4 : 3;
+    const int ri = img->is_bgra ? 2 : 0;     /* R 所在字节；B 在 2 - ri */
+    const uint8_t *row0 = img->pixels + (size_t)y0 * img->stride;
+    const uint8_t *row1 = img->pixels + (size_t)y1 * img->stride;
+    const uint8_t *p00 = row0 + (size_t)x0 * bpp, *p01 = row0 + (size_t)x1 * bpp;
+    const uint8_t *p10 = row1 + (size_t)x0 * bpp, *p11 = row1 + (size_t)x1 * bpp;
+    const int src[3] = { ri, 1, 2 - ri };
     for (int ch = 0; ch < 3; ch++) {
-        double a = p00[ch] * (1 - fx) + p01[ch] * fx;
-        double b = p10[ch] * (1 - fx) + p11[ch] * fx;
+        int o = src[ch];
+        double a = p00[o] * (1 - fx) + p01[o] * fx;
+        double b = p10[o] * (1 - fx) + p11[o] * fx;
         out[ch] = a * (1 - fy) + b * fy;
     }
 }
@@ -613,14 +630,39 @@ static void sample_cell(const vdd_image *img, const vdd_geom *g,
         sample_bilinear(img, px, py, out);
         return;
     }
+    /*
+     * 格内 k×k 个点按格心处的局部仿射展开：格心映射一次，求出映射在格心的
+     * 雅可比，其余点只做乘加。原来每个点各走一遍 geom_map（含透视除法，
+     * 边缘校正启用时还有剖面插值与形状函数），每格 9 次降到 1 次（纯单应）
+     * 或 3 次（边缘校正，雅可比用 0.3 格步长的前向差分）。
+     * 误差是二阶项：纯单应为 h6·偏移²·每格像素，±0.3 格偏移、强透视下也在
+     * 0.01 px 以下；边缘校正场在全符号尺度上才弯 1–2 格，0.3 格内的曲率
+     * 贡献约 1e-4 格。回归样本上判决结果逐格不变。
+     */
+    double cx, cy, jxx, jxy, jyx, jyy;
+    if (!g->refined) {
+        const double *h = g->h;
+        double X = h[0] * gx + h[1] * gy + h[2];
+        double Y = h[3] * gx + h[4] * gy + h[5];
+        double iw = 1.0 / (h[6] * gx + h[7] * gy + h[8]);
+        cx = X * iw; cy = Y * iw;
+        jxx = (h[0] - cx * h[6]) * iw; jxy = (h[1] - cx * h[7]) * iw;
+        jyx = (h[3] - cy * h[6]) * iw; jyy = (h[4] - cy * h[7]) * iw;
+    } else {
+        double ax, ay, bx, by;
+        geom_map(g, gx, gy, &cx, &cy);
+        geom_map(g, gx + 0.3, gy, &ax, &ay);
+        geom_map(g, gx, gy + 0.3, &bx, &by);
+        jxx = (ax - cx) / 0.3; jyx = (ay - cy) / 0.3;
+        jxy = (bx - cx) / 0.3; jyy = (by - cy) / 0.3;
+    }
     double acc[3] = { 0, 0, 0 };
     for (int i = 0; i < k; i++) {
+        double ox = -0.3 + 0.6 * (i + 0.5) / k;
         for (int j = 0; j < k; j++) {
-            double ox = -0.3 + 0.6 * (i + 0.5) / k;
             double oy = -0.3 + 0.6 * (j + 0.5) / k;
-            double px, py, c[3];
-            geom_map(g, gx + ox, gy + oy, &px, &py);
-            sample_bilinear(img, px, py, c);
+            double c[3];
+            sample_bilinear(img, cx + jxx * ox + jxy * oy, cy + jyx * ox + jyy * oy, c);
             acc[0] += c[0]; acc[1] += c[1]; acc[2] += c[2];
         }
     }
@@ -763,9 +805,10 @@ static const int CHAN_BIT[3] = { 4, 2, 1 };
 typedef struct {
     double c[4][8][3];          /* 角序 TL,TR,BL,BR，各 8 色 RGB */
     int valid;
+    int valid4;                 /* 只看 4 色档用到的四色是否分得开 */
 } vdd_palette;
 
-/* 采四条定标条建表；八色分不开则 valid=0 */
+/* 采四条定标条建表；八色分不开则 valid=0，选定四色分不开则 valid4=0 */
 static void build_palette(const vdd_image *img, const vdd_geom *g, vdd_palette *pal) {
     const int n = g->n;
     int strips[4][2];
@@ -790,6 +833,18 @@ static void build_palette(const vdd_image *img, const vdd_geom *g, vdd_palette *
             }
         }
     }
+    /* 定标条照旧测全八色，4 色档只取其中四色，间距门限同上 */
+    pal->valid4 = 1;
+    for (int s = 0; s < 4 && pal->valid4; s++)
+        for (int u = 0; u < 4 && pal->valid4; u++)
+            for (int v = u + 1; v < 4; v++) {
+                double d = 0;
+                for (int k = 0; k < 3; k++) {
+                    double e = pal->c[s][PALETTE4[u]][k] - pal->c[s][PALETTE4[v]][k];
+                    d += e * e;
+                }
+                if (d < PAL_MIN_SEP * PAL_MIN_SEP) { pal->valid4 = 0; break; }
+            }
 }
 
 /* 位置 (s,t)（归一化 0..1）处第 v 色的插值参考值 */
@@ -801,14 +856,14 @@ static inline void palette_at(const vdd_palette *pal, double s, double t,
                + w[2] * pal->c[2][v][k] + w[3] * pal->c[3][v][k];
 }
 
-/* 最近邻判决，margin 为归一化裕度（0=两色等距，1=完全确定）*/
+/* 在 vs[0..nv) 这几色里做最近邻，返回下标；margin 为归一化裕度（0=两色等距，1=完全确定）*/
 static int classify_cell(const vdd_palette *pal, double s, double t,
-                         const double p[3], double *margin) {
+                         const int *vs, int nv, const double p[3], double *margin) {
     double best = 1e30, second = 1e30;
     int bi = 0;
-    for (int v = 0; v < 8; v++) {
+    for (int v = 0; v < nv; v++) {
         double ref[3], d = 0;
-        palette_at(pal, s, t, v, ref);
+        palette_at(pal, s, t, vs[v], ref);
         for (int k = 0; k < 3; k++) { double e = p[k] - ref[k]; d += e * e; }
         if (d < best) { second = best; best = d; bi = v; }
         else if (d < second) second = d;
@@ -831,6 +886,106 @@ static int classify_dark(const vdd_palette *pal, double s, double t,
         d0 += a * a; d7 += b * b;
     }
     return d0 < d7;
+}
+
+/*
+ * 逐行预计算的调色板。palette_at 是位置的双线性函数，同一行内 t 固定，
+ * 可写成 ref(s) = L + s·(R − L)，每格每色只剩 3 次乘加，
+ * 不必每格对 8 色各算一遍四角权重（原来每格 8 次 palette_at，偏移校正再 8 次）。
+ */
+typedef struct {
+    double a[8][3], b[8][3];          /* 下标是判决下标（8 色即格值，4 色即 2 bit 值） */
+    /* 在用各色在该行上的一阶、二阶矩（分区光照模型用）：
+       均值 = ma + s·mb，均方 = qaa + 2s·qab + s²·qbb */
+    double ma[3], mb[3], qaa[3], qab[3], qbb[3];
+} pal_row;
+
+/* vs[0..nv) 为在用的颜色：8 色档全部八色，4 色档只有选定四色——
+   矩匹配的前提是「数据格在这几色上等概率」，矩只能按在用的颜色算 */
+static void pal_row_init(const vdd_palette *pal, double t, const int *vs, int nv,
+                         pal_row *pr) {
+    for (int k = 0; k < 3; k++) {
+        pr->ma[k] = pr->mb[k] = pr->qaa[k] = pr->qab[k] = pr->qbb[k] = 0;
+        for (int i = 0; i < nv; i++) {
+            int v = vs[i];
+            double l = (1 - t) * pal->c[0][v][k] + t * pal->c[2][v][k];
+            double r = (1 - t) * pal->c[1][v][k] + t * pal->c[3][v][k];
+            double a = l, b = r - l;
+            pr->a[i][k] = a;
+            pr->b[i][k] = b;
+            pr->ma[k] += a / nv; pr->mb[k] += b / nv;
+            pr->qaa[k] += a * a / nv; pr->qab[k] += a * b / nv; pr->qbb[k] += b * b / nv;
+        }
+    }
+}
+
+/* 对给定的 nv 色参考值做最近邻，返回下标，margin 定义同 classify_cell */
+static int classify_ref(const double ref[8][3], int nv, const double p[3], double *margin) {
+    double best = 1e30, second = 1e30;
+    int bi = 0;
+    for (int v = 0; v < nv; v++) {
+        double e0 = p[0] - ref[v][0], e1 = p[1] - ref[v][1], e2 = p[2] - ref[v][2];
+        double d = e0 * e0 + e1 * e1 + e2 * e2;
+        if (d < best) { second = best; best = d; bi = v; }
+        else if (d < second) second = d;
+    }
+    double b = sqrt(best), sc = sqrt(second);
+    *margin = (sc - b) / (sc + b + 1e-9);
+    return bi;
+}
+
+/*
+ * 分区光照模型。
+ *
+ * 四条定标条只在四角，双线性插值只能表达「从一角到另一角的线性渐变」，
+ * 表达不了屏幕中部的反光斑、背光不均这类局部亮度变化——用户反馈的头号问题
+ * 正是环境光干扰。这几类干扰在每个通道上都近似是仿射的：
+ *     反光（向白洗）  obs = (1−k)·I + 255·k
+ *     暗斑（增益降）  obs = g·I
+ *     偏色            每通道各自的 g
+ * 因此每个区每个通道估一组增益 a 与偏置 b，参考色取 a·P + b（P 为定标条插值）。
+ *
+ * 估计不依赖第一遍的判决结果（矩匹配）：载荷是 RS 编码后的字节流，八色近似
+ * 等概率，一个区里数据格的均值与方差应当分别等于同位置调色板八色的均值与方差
+ * 经过仿射后的值，于是 a = sqrt(var_obs / var_pal)，b = mean_obs − a·mean_pal。
+ * 这是原有整体偏移校正（a=1、只估 b、全符号一个值）的推广。
+ *
+ * 先试过「按第一遍判决结果逐色重算簇心」：反光区里第一遍本身就大面积判错，
+ * 用错的标签估出的簇心只会把错误固化，合成反光样本上几乎没有收益，
+ * 而真机 N=112 诊断包反而少过了几个块。矩匹配没有这个自我强化的问题。
+ *
+ * 参数定义在区中心，区间按双线性插值——README 记录过「硬选最近角」在分界线上
+ * 突变、实测比插值差，这里不重蹈。数据格太少的区（角部、定标条附近）退回
+ * 整体偏移，即 a=1、b=bias。
+ */
+#define ZONE_MAX 4
+#ifndef ZONE_MIN_CELLS
+#define ZONE_MIN_CELLS 64       /* 区内数据格少于此数则退回整体偏移 */
+#endif
+
+typedef struct {
+    int z;                                  /* 每边分区数 */
+    double d[ZONE_MAX][ZONE_MAX][2][3];     /* [区行][区列] 中心处的 {增益, 偏置} × 三通道 */
+} zone_delta;
+
+/* 归一化坐标 x 在区中心之间的插值位置：下标 i0、i1 与权重 w（两端外推为常数） */
+static inline void zone_lerp(int z, double x, int *i0, int *i1, double *w) {
+    double f = x * z - 0.5;
+    int a = (int)floor(f);
+    if (a < 0) { *i0 = *i1 = 0; *w = 0; return; }
+    if (a >= z - 1) { *i0 = *i1 = z - 1; *w = 0; return; }
+    *i0 = a; *i1 = a + 1; *w = f - a;
+}
+
+/* 行 t 上每个区列中心处的增益与偏置（沿 t 插好），每格再沿 s 插一次 */
+static void zone_row(const zone_delta *zd, double t, double out[ZONE_MAX][2][3]) {
+    int r0, r1;
+    double w;
+    zone_lerp(zd->z, t, &r0, &r1, &w);
+    for (int zc = 0; zc < zd->z; zc++)
+        for (int j = 0; j < 2; j++)
+            for (int k = 0; k < 3; k++)
+                out[zc][j][k] = zd->d[r0][zc][j][k] * (1 - w) + zd->d[r1][zc][j][k] * w;
 }
 
 /*
@@ -1455,6 +1610,7 @@ typedef struct {
     vdd_geom geom;
     double thr[3], halfgap[3];
     vdd_palette pal;            /* 定标条实测调色板；valid=0 时退回阈值判决 */
+    int colors;                 /* 头部调制位：8 或 4 */
     int payload_len;
     int header_disagree;        /* 三副本表决中出现分歧的位数 */
 } probe_result;
@@ -1467,6 +1623,144 @@ typedef struct {
  * 找到（它们只是四个角），单应性却会整体错尺度，格心全数偏掉。
  * 现场表现就是「定位成功但头部校验失败」，靠人工对齐两端档位极易踩坑。
  */
+/*
+ * 单格判决（不做逐行预计算的直通版本），抽样与退路阈值判决用。
+ * 调色板可用时按在用各色最近邻，否则三通道独立阈值；erase 回填是否低置信，
+ * 判据与全量判决完全相同（擦除门限 PAL_ERASE / 0.15）。p 须已减去偏移。
+ * 返回值即写进位流的那几位：8 色为格值，4 色为 2 bit 值。
+ */
+static int decide_plain(const probe_result *pr, double s, double t,
+                        const double p[3], int *erase) {
+    const int four = pr->colors == 4;
+    if (four ? pr->pal.valid4 : pr->pal.valid) {
+        double conf;
+        int v = classify_cell(&pr->pal, s, t, four ? PALETTE4 : COLORS8,
+                              four ? 4 : 8, p, &conf);
+        *erase = conf < PAL_ERASE;
+        return v;
+    }
+    if (four) {
+        /*
+         * 4 色的阈值退路：三通道归一化偏离 u 与各组色的 ±1 符号模式做相关，
+         * 取最大者。逐通道独立二值判决在这里不适用——单通道翻转会落到组外
+         * 的格值上，而组外格值离三个组内色等距，无从判起。
+         * 置信度取最大与次大相关值之差的一半：三通道都恰在半间隔上时为 1，
+         * 与 8 色退路的 min|u| 同一量纲，擦除门限沿用 0.15。
+         */
+        double u[3], best = -1e30, second = -1e30;
+        int bi = 0;
+        for (int ch = 0; ch < 3; ch++) u[ch] = (p[ch] - pr->thr[ch]) / pr->halfgap[ch];
+        for (int d = 0; d < 4; d++) {
+            double sc = 0;
+            for (int ch = 0; ch < 3; ch++) sc += (PALETTE4[d] & CHAN_BIT[ch]) ? u[ch] : -u[ch];
+            if (sc > best) { second = best; best = sc; bi = d; }
+            else if (sc > second) second = sc;
+        }
+        *erase = (best - second) * 0.5 < 0.15;
+        return bi;
+    }
+    int v = 0;
+    double conf = 1e9;
+    for (int ch = 0; ch < 3; ch++) {
+        double d = p[ch] - pr->thr[ch];
+        if (d > 0) v |= CHAN_BIT[ch];
+        double a = fabs(d) / pr->halfgap[ch];
+        if (a < conf) conf = a;
+    }
+    *erase = conf < 0.15;
+    return v;
+}
+
+/*
+ * 从交织位流里取出第 i 块（数据段 + 奇偶段）。seras/eras 非空时回填擦除位置，
+ * 返回擦除数；超过 RS_ERAS_MAX 的标记忽略，按错误处理。
+ */
+static int extract_block(const uint8_t *stream, const uint8_t *seras, int nb,
+                         const int *blens, int max_len, int i,
+                         uint8_t *block, int *eras) {
+    int n_eras = 0, bp = 0, pos = 0;
+    /* 数据字节：第 j 轮的本块槽位 */
+    for (int j = 0; j < max_len; j++) {
+        for (int k = 0; k < nb; k++) {
+            if (j >= blens[k]) continue;
+            if (k == i) {
+                block[bp] = stream[pos];
+                if (seras && seras[pos] && n_eras < RS_ERAS_MAX) eras[n_eras++] = bp;
+                bp++;
+            }
+            pos++;
+        }
+    }
+    /* 奇偶字节 */
+    for (int j = 0; j < RS_PARITY; j++) {
+        for (int k = 0; k < nb; k++) {
+            if (k == i) {
+                block[bp] = stream[pos];
+                if (seras && seras[pos] && n_eras < RS_ERAS_MAX) eras[n_eras++] = bp;
+                bp++;
+            }
+            pos++;
+        }
+    }
+    return n_eras;
+}
+
+/* 分阶段耗时回填。各出口都要填，走到哪算到哪 */
+static void set_diag_times(vdd_diag *d, double find, double probe, double beta,
+                           double sample, double decide, double rs) {
+    d->ms_find = find;
+    d->ms_probe = probe;
+    d->ms_beta = beta;
+    d->ms_sample = sample;
+    d->ms_decide = decide;
+    d->ms_rs = rs;
+    d->ms_geom = g_ms_geom;
+    d->ms_calib = g_ms_calib;
+}
+
+/*
+ * 抽样格：坏帧早退与重复帧判定共用。每 PROBE_STEP 个数据格取一个，
+ * 少于 PROBE_MIN 个（数据区太小）就不做这两项判定。
+ */
+#define PROBE_STEP 16
+#define PROBE_MIN 64
+
+/*
+ * 重复帧门限：不同格数 × DUP_DIFF_DIV <= 抽样数，即不同格不超过 1/4。
+ *
+ * 标定（抽样数 474–969）：
+ *   同一符号的两次拍摄      0.3%（c128_1 与 c128_2）、2.9%（c128_2 与 hdr96，
+ *                          后者是 8 px/格 的截屏、纠正 270 字节）
+ *   不同符号                85%–90%（金图像四种失真之间、真机六张之间、
+ *                          三个诊断包相邻失败帧之间，共 30 余对）
+ * 理论值是 7/8 = 87.5%，1/4 离两边都很远；抽样数 500 时 87.5% 的标准差只有
+ * 1.5%。一帧要被误判为重复，它本身的误判率得高到 25% 上下——那样的帧本来也
+ * 解不出。
+ */
+#ifndef DUP_DIFF_DIV
+#define DUP_DIFF_DIV 4
+#endif
+
+/*
+ * 坏帧早退门限：低置信格占抽样数的比例超过 SIGNAL_LOW_MUL / SIGNAL_LOW_DIV
+ * （1/5）。低置信判据与擦除完全相同（PAL_ERASE / 0.15）。
+ *
+ * 标定（68 帧：金图像 8、真机照片 8、三个诊断包 28（另 2 帧定位或头部就失败）、
+ *       合成局部光照干扰 24）：
+ *   至少过一个 RS 块的帧    最高 8.3%（真机，诊断包 N=112 fail08，1/18）；
+ *                          合成反光样本最高 11.1%（暗斑 4K 帧，第二遍分区修正后 22/23）
+ *   以 VDD_ERR_SIGNAL 收场   12.6%–31.3%，14 帧
+ * 取 20%：比能过块的真机帧高出一倍多、比合成干扰帧高出 1.8 倍，宁可漏判——
+ * 漏掉的 3 帧（12.6%、16.2%、18.7%）照旧走完全流程，由打包后的字节级擦除
+ * 计数兜底。抽样 500 格时 11% 处的标准差约 1.4%，20% 在 6σ 开外。
+ */
+#ifndef SIGNAL_LOW_MUL
+#define SIGNAL_LOW_MUL 1
+#endif
+#ifndef SIGNAL_LOW_DIV
+#define SIGNAL_LOW_DIV 5
+#endif
+
 static int probe_grid(const vdd_image *img, int n, double corners[4][2],
                       int32_t *free_idx, probe_result *out) {
     const double cc = FINDER / 2.0;
@@ -1481,7 +1775,8 @@ static int probe_grid(const vdd_image *img, int n, double corners[4][2],
     double diag_cells = (n - 2 * cc) * 1.41421356;
     g->cell_px = sqrt(dx * dx + dy * dy) / (diag_cells > 1 ? diag_cells : 1);
 
-    /* 用边框环标定边缘弓曲，补上单应性表达不了的径向畸变（带自校验闸门）*/
+    /* 用边框环标定边缘弓曲，补上单应性表达不了的径向畸变（带自校验闸门）。
+       跟踪态也每帧重测，不随锁复用——原因见 README「试过但退回的优化」 */
     double t0 = clk_ms();
     refine_edges_guarded(img, g);
     double t1 = clk_ms();
@@ -1521,8 +1816,12 @@ static int probe_grid(const vdd_image *img, int n, double corners[4][2],
     }
     if (head[0] != MAGIC || (head[1] >> 4) != VERSION || crc8(head, 4) != head[4])
         return VDD_ERR_HEADER;
+    /* 低 4 位：bit1..0 调制方式（0 = 8 色，1 = 4 色，2/3 保留），bit3..2 保留为 0。
+       调制位在 crc8 覆盖范围内，读错会先被 CRC 拦下 */
+    if ((head[1] & 0x0C) || (head[1] & 0x03) > MOD_4) return VDD_ERR_HEADER;
+    out->colors = (head[1] & 0x03) == MOD_4 ? 4 : 8;
     out->payload_len = (head[2] << 8) | head[3];
-    if (out->payload_len <= 0 || out->payload_len > vdd_net_capacity(n))
+    if (out->payload_len <= 0 || out->payload_len > vdd_net_capacity_colors(n, out->colors))
         return VDD_ERR_CAPACITY;
     return 0;
 }
@@ -1646,92 +1945,21 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
 
     double *thr = pr.thr, *halfgap = pr.halfgap;
 
-    /* 工作区：采样值 + 格值 + 擦除标记。判决要用到全符号的统计量，
-       采样与判决拆成两遍，中间算一次整体偏移。double 放在最前保证对齐。 */
-    uint8_t *ws = (uint8_t *)malloc((size_t)n * n * 3 * sizeof(double)
-                                    + (size_t)n * n * 2);
-    if (!ws) { free(free_idx); return VDD_ERR_NOMEM; }
-    double *cellp = (double *)(void *)ws;           /* 每格三通道采样值 */
-    uint8_t *cellv = ws + (size_t)n * n * 3 * sizeof(double);
-    uint8_t *celle = cellv + (size_t)n * n;         /* 1 = 低置信度(擦除) */
-
-    /* 第一遍：采样 */
-    for (int r = 0; r < n; r++)
-        for (int c = 0; c < n; c++)
-            sample_cell(img, &geom, c + 0.5, r + 0.5, &cellp[(r * n + c) * 3]);
-
-    ms_sample = clk_ms() - t_stage;
-    t_stage = clk_ms();
-
-    int n_free = free_cells(n, free_idx);
-
     /*
-     * 判决偏移校正。载荷是 RS 编码后的字节流，八色近似等概率，因此所有
-     * 数据格的三通道均值应当等于同位置调色板八色的均值。两者之差就是这
-     * 一帧数据区相对定标条的整体偏移。
-     *
-     * 为什么需要它：四条定标条在每一帧里内容相同，屏幕换帧过渡期的新旧
-     * 帧混合、杂散光、相邻格串扰都只改变数据区，定标条读数照旧。于是
-     * 调色板一切指标正常（八色间距 90 以上），判决却整体偏向亮端——
-     * 实测坏帧里黑色格只剩 3.6%、白色格高达 25.9%，本该各 12.5%。
-     * 把这个差值减掉，八色分布随即回到 12% 附近。
+     * 色数相关的一切从这里开始分叉：每格位数、判决用的颜色集合、调色板可用性，
+     * 以及偏移校正与分区矩匹配里「在用各色等概率」的那个集合。头部判决与档位
+     * 探测都在 probe_grid 里、调制位读出之前，两档共用。
      */
-    double bias[3] = { 0, 0, 0 };
-    if (pr.pal.valid) {
-        /* 只统计真正承载数据的格，尾部未用的格不参与 */
-        int nb0 = (payload_len + RS_DATA_MAX - 1) / RS_DATA_MAX;
-        long need = ((long)payload_len + (long)RS_PARITY * nb0) * 8;
-        int last = HEADER_CELLS + (int)((need + 2) / 3);
-        if (last > n_free) last = n_free;
-        double sm[3] = { 0, 0, 0 }, sr[3] = { 0, 0, 0 };
-        int cnt = 0;
-        for (int i = HEADER_CELLS; i < last; i++) {
-            int idx = free_idx[i];
-            double s = ((idx % n) + 0.5) / n, t = ((idx / n) + 0.5) / n;
-            for (int v = 0; v < 8; v++) {
-                double ref[3];
-                palette_at(&pr.pal, s, t, v, ref);
-                for (int k = 0; k < 3; k++) sr[k] += ref[k];
-            }
-            for (int k = 0; k < 3; k++) sm[k] += cellp[(size_t)idx * 3 + k];
-            cnt++;
-        }
-        if (cnt > 0)
-            for (int k = 0; k < 3; k++)
-                bias[k] = sm[k] / cnt - sr[k] / (cnt * 8.0);
-    }
-
-    /* 第二遍：判决 + 置信度。调色板可用时按实测八色做最近邻，
-       否则退回三通道独立阈值（任一通道距阈值 < 15% 半间隔即标记擦除候选）。 */
-    for (int r = 0; r < n; r++) {
-        for (int c = 0; c < n; c++) {
-            double p[3];
-            for (int k = 0; k < 3; k++)
-                p[k] = cellp[((size_t)r * n + c) * 3 + k] - bias[k];
-            int v;
-            double conf;
-            if (pr.pal.valid) {
-                v = classify_cell(&pr.pal, (c + 0.5) / n, (r + 0.5) / n, p, &conf);
-                celle[r * n + c] = conf < PAL_ERASE ? 1 : 0;
-            } else {
-                v = 0;
-                conf = 1e9;
-                for (int ch = 0; ch < 3; ch++) {
-                    double d = p[ch] - thr[ch];
-                    if (d > 0) v |= CHAN_BIT[ch];
-                    double a = fabs(d) / halfgap[ch];
-                    if (a < conf) conf = a;
-                }
-                celle[r * n + c] = conf < 0.15 ? 1 : 0;
-            }
-            cellv[r * n + c] = (uint8_t)v;
-        }
-    }
-    ms_decide = clk_ms() - t_stage;
-    t_stage = clk_ms();
+    const int colors = pr.colors;
+    const int bpc = colors == 4 ? 2 : 3;
+    const int *vs = colors == 4 ? PALETTE4 : COLORS8;
+    const int nv = colors;
+    const int pal_ok = colors == 4 ? pr.pal.valid4 : pr.pal.valid;
 
     if (diag) {
+        memset(diag, 0, sizeof *diag);
         diag->grid = n;
+        diag->colors = colors;
         diag->cell_px = geom.cell_px;
         diag->beta = geom.beta;
         double bow = 0;
@@ -1746,27 +1974,317 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
             diag->thr[ch] = thr[ch];
             diag->halfgap[ch] = halfgap[ch];
         }
+        diag->probe_diff = -1;
     }
 
-    /* 数据格 -> 位流 -> 交织字节 + 字节级擦除标记 */
+    /*
+     * 承载位流的只有 free_idx[HEADER_CELLS, last)：头部已在 probe_grid 里判完，
+     * 角部块、边框环、定标条与尾部未用格的判决值从来没人读。采样与判决
+     * 只跑这一段，N=128 省掉约一成的格。
+     */
+    int n_free = free_cells(n, free_idx);
     int nb = (payload_len + RS_DATA_MAX - 1) / RS_DATA_MAX;
     int stream_len = payload_len + RS_PARITY * nb;
-    uint8_t stream[8192];
-    uint8_t seras[8192];
-    if (stream_len > (int)sizeof stream) { free(ws); free(free_idx); return VDD_ERR_CAPACITY; }
-    memset(stream, 0, (size_t)stream_len);
-    memset(seras, 0, (size_t)stream_len);
-    long bitpos = 0;
-    long total_bits = (long)stream_len * 8;
-    for (int i = HEADER_CELLS; i < n_free && bitpos < total_bits; i++) {
-        int idx = free_idx[i];
-        uint8_t v = cellv[idx];
-        uint8_t er = celle[idx];
-        for (int b = 2; b >= 0 && bitpos < total_bits; b--) {
-            if ((v >> b) & 1) stream[bitpos >> 3] |= (uint8_t)(0x80 >> (bitpos & 7));
-            if (er) seras[bitpos >> 3] = 1;
-            bitpos++;
+    int last = HEADER_CELLS + (int)(((long)stream_len * 8 + bpc - 1) / bpc);
+    if (last > n_free) last = n_free;
+    const int n_data = last - HEADER_CELLS;
+
+    /* 工作区：采样值 + 格值 + 擦除标记。判决要用到全符号的统计量，
+       采样与判决拆成两遍。double 放在最前保证对齐。 */
+    uint8_t *ws = (uint8_t *)malloc((size_t)n * n * 3 * sizeof(double)
+                                    + (size_t)n * n * 4);
+    if (!ws) { free(free_idx); return VDD_ERR_NOMEM; }
+    double *cellp = (double *)(void *)ws;           /* 每格三通道采样值 */
+    uint8_t *cellv = ws + (size_t)n * n * 3 * sizeof(double);   /* 最终判决 */
+    uint8_t *celle = cellv + (size_t)n * n;         /* 1 = 低置信度(擦除) */
+    uint8_t *cellv1 = celle + (size_t)n * n;        /* 第一遍（整体偏移）判决 */
+    uint8_t *celle1 = cellv1 + (size_t)n * n;
+
+    /*
+     * 抽样：数据格序列里每 pstep 个取一个。数据格按行优先排列，等步长抽样
+     * 自然覆盖上下全程——LCD 逐行刷新，换帧过渡带是按行分布的，只抽一部分行
+     * 会看漏。每行格数与步长不整除，相邻行的抽样列互相错开，左右也覆盖得到。
+     * 抽样位置只取决于档位与载荷长度，重复帧判定靠这一点跨帧比对。
+     */
+    int pstep = PROBE_STEP;
+    while (n_data / pstep > VDD_PROBE_MAX) pstep++;
+    int n_probe = 0, probe_low = 0, probe_diff = -1;
+    uint8_t probe_v[VDD_PROBE_MAX];
+    if (n_data / pstep >= PROBE_MIN) {
+        double pbias[3] = { 0, 0, 0 }, sm[3] = { 0, 0, 0 }, sr[3] = { 0, 0, 0 };
+        for (int i = HEADER_CELLS + pstep / 2; i < last && n_probe < VDD_PROBE_MAX; i += pstep) {
+            int idx = free_idx[i];
+            double *p = &cellp[(size_t)idx * 3];
+            sample_cell(img, &geom, (idx % n) + 0.5, (idx / n) + 0.5, p);
+            for (int k = 0; k < 3; k++) sm[k] += p[k];
+            if (pal_ok) {
+                double s = ((idx % n) + 0.5) / n, t = ((idx / n) + 0.5) / n;
+                for (int v = 0; v < nv; v++) {
+                    double ref[3];
+                    palette_at(&pr.pal, s, t, vs[v], ref);
+                    for (int k = 0; k < 3; k++) sr[k] += ref[k] / nv;
+                }
+            }
+            n_probe++;
         }
+        /* 与全量判决同一套偏移校正，抽样上的判决才和全量第一遍可比 */
+        if (pal_ok)
+            for (int k = 0; k < 3; k++) pbias[k] = (sm[k] - sr[k]) / n_probe;
+        for (int j = 0; j < n_probe; j++) {
+            int idx = free_idx[HEADER_CELLS + pstep / 2 + j * pstep];
+            double p[3];
+            for (int k = 0; k < 3; k++) p[k] = cellp[(size_t)idx * 3 + k] - pbias[k];
+            double s = ((idx % n) + 0.5) / n, t = ((idx / n) + 0.5) / n;
+            int er;
+            probe_v[j] = (uint8_t)decide_plain(&pr, s, t, p, &er);
+            probe_low += er;
+        }
+        if (lock && lock->valid && lock->dup_n == n_probe &&
+            lock->dup_grid == n && lock->dup_len == payload_len &&
+            lock->dup_colors == colors) {
+            probe_diff = 0;
+            for (int j = 0; j < n_probe; j++) probe_diff += probe_v[j] != lock->dup_v[j];
+        }
+    }
+    if (diag) {
+        diag->probe_cells = n_probe;
+        diag->probe_low = probe_low;
+        diag->probe_diff = probe_diff;
+    }
+
+    /*
+     * 重复帧：抽样格判决值与上一成功帧几乎全同。不同符号的数据格是 RS 编码后
+     * 的随机字节，八色等概率，两帧同位置同色的概率只有 1/8，不同格占约 87.5%
+     * （4 色档是 1/4，不同格约 75%，离门限 1/4 同样很远）；
+     * 同一符号两次扫描只差两帧各自的误判，能解出的帧误判率在几个百分点。
+     * 门限取 1/4，两边各留一大截余量（见 DUP_DIFF_DIV 处的标定记录）。
+     * 判重放在坏帧早退之前：静止画面下质量一般的重复帧应当算「已收到」，
+     * 而不是算失败去触发曝光解锁与重新对焦。
+     */
+    if (probe_diff >= 0 && probe_diff * DUP_DIFF_DIV <= n_probe) {
+        ms_sample = clk_ms() - t_stage;
+        if (diag) set_diag_times(diag, ms_find, ms_probe, ms_beta, ms_sample, 0, 0);
+        /* 角点照常跟踪；档位、朝向、β 与重复帧记录都不变 */
+        for (int k = 0; k < 4; k++) {
+            lock->corners[k][0] = corners[k][0];
+            lock->corners[k][1] = corners[k][1];
+        }
+        free(ws); free(free_idx);
+        return VDD_DUPLICATE;
+    }
+
+    /*
+     * 坏帧早退：低置信格比例明显超标，直接放弃，不做全采样、判决与纠错。
+     * 这类帧多是屏幕换帧过渡期抓到的（真机 N=128 诊断包里占 44%），
+     * 原先要把整帧跑完才在打包后被字节级擦除计数拦下。门限见 SIGNAL_LOW_DIV。
+     * 抽样判决只做了整体偏移、没做分区修正，门限的余量已把这一点算进去。
+     */
+    if (n_probe > 0 && probe_low * SIGNAL_LOW_DIV > n_probe * SIGNAL_LOW_MUL) {
+        ms_sample = clk_ms() - t_stage;
+        if (diag) {
+            diag->rs_blocks = nb;
+            set_diag_times(diag, ms_find, ms_probe, ms_beta, ms_sample, 0, 0);
+        }
+        free(ws); free(free_idx);
+        return VDD_ERR_SIGNAL;
+    }
+
+    /* 全量采样（抽样格已采过，跳过） */
+    for (int i = HEADER_CELLS; i < last; i++) {
+        int rel = i - HEADER_CELLS;
+        if (n_probe && rel % pstep == pstep / 2 && rel / pstep < n_probe) continue;
+        int idx = free_idx[i];
+        sample_cell(img, &geom, (idx % n) + 0.5, (idx / n) + 0.5, &cellp[(size_t)idx * 3]);
+    }
+
+    ms_sample = clk_ms() - t_stage;
+    t_stage = clk_ms();
+
+    /*
+     * 判决偏移校正。载荷是 RS 编码后的字节流，八色近似等概率，因此所有
+     * 数据格的三通道均值应当等于同位置调色板八色的均值。两者之差就是这
+     * 一帧数据区相对定标条的整体偏移。
+     *
+     * 为什么需要它：四条定标条在每一帧里内容相同，屏幕换帧过渡期的新旧
+     * 帧混合、杂散光、相邻格串扰都只改变数据区，定标条读数照旧。于是
+     * 调色板一切指标正常（八色间距 90 以上），判决却整体偏向亮端——
+     * 实测坏帧里黑色格只剩 3.6%、白色格高达 25.9%，本该各 12.5%。
+     * 把这个差值减掉，八色分布随即回到 12% 附近。
+     *
+     * 它现在是第一遍判决的偏移，也是分区修正在样本不足时收缩回去的目标。
+     * 八色均值也是双线性的，先把四角八色平均好，每格只算一次插值。
+     */
+    /* 4 色档同理，只是等概率的是在用的四色，均值只能按这四色算，否则整体偏 */
+    double bias[3] = { 0, 0, 0 };
+    if (pal_ok && n_data > 0) {
+        vdd_palette pm;
+        for (int q = 0; q < 4; q++)
+            for (int k = 0; k < 3; k++) {
+                double a = 0;
+                for (int v = 0; v < nv; v++) a += pr.pal.c[q][vs[v]][k];
+                pm.c[q][0][k] = a / nv;
+            }
+        double sm[3] = { 0, 0, 0 }, sr[3] = { 0, 0, 0 };
+        for (int i = HEADER_CELLS; i < last; i++) {
+            int idx = free_idx[i];
+            double ref[3];
+            palette_at(&pm, ((idx % n) + 0.5) / n, ((idx / n) + 0.5) / n, 0, ref);
+            for (int k = 0; k < 3; k++) {
+                sr[k] += ref[k];
+                sm[k] += cellp[(size_t)idx * 3 + k];
+            }
+        }
+        for (int k = 0; k < 3; k++) bias[k] = (sm[k] - sr[k]) / n_data;
+    }
+
+    /* 分区数按数据格数自适应：每区每色平均至少约 50 个样本 */
+    int zn = 0;
+    if (pal_ok) {
+        zn = (int)sqrt(n_data / 400.0);
+        if (zn > ZONE_MAX) zn = ZONE_MAX;
+        if (zn < 2) zn = 0;
+    }
+    /* 每区每通道的矩：格数、Σobs、Σobs²、Σ调色板八色均值、Σ调色板八色均方 */
+    double zs[ZONE_MAX][ZONE_MAX][3][4];
+    int zc_n[ZONE_MAX][ZONE_MAX];
+    if (zn) { memset(zs, 0, sizeof zs); memset(zc_n, 0, sizeof zc_n); }
+
+    /*
+     * 第一遍判决 + 置信度。调色板可用时按实测八色（逐行预计算）+ 整体偏移
+     * 做最近邻；否则退回三通道独立阈值。顺带按区累加矩。
+     */
+    {
+        pal_row prow;
+        int cur_r = -1;
+        for (int i = HEADER_CELLS; i < last; i++) {
+            int idx = free_idx[i];
+            int r = idx / n, c = idx % n;
+            const double *p = &cellp[(size_t)idx * 3];
+            double s = (c + 0.5) / n;
+            if (!pal_ok) {
+                double q[3] = { p[0], p[1], p[2] };
+                int er;
+                cellv1[idx] = (uint8_t)decide_plain(&pr, s, (r + 0.5) / n, q, &er);
+                celle1[idx] = (uint8_t)er;
+                continue;
+            }
+            if (r != cur_r) { pal_row_init(&pr.pal, (r + 0.5) / n, vs, nv, &prow); cur_r = r; }
+            double ref[8][3];
+            for (int v = 0; v < nv; v++)
+                for (int k = 0; k < 3; k++)
+                    ref[v][k] = prow.a[v][k] + s * prow.b[v][k] + bias[k];
+            double conf;
+            int v = classify_ref((const double (*)[3])ref, nv, p, &conf);
+            cellv1[idx] = (uint8_t)v;
+            celle1[idx] = conf < PAL_ERASE ? 1 : 0;
+            if (zn) {
+                int zr = r * zn / n, zcol = c * zn / n;
+                zc_n[zr][zcol]++;
+                for (int k = 0; k < 3; k++) {
+                    double *z4 = zs[zr][zcol][k];
+                    z4[0] += p[k]; z4[1] += p[k] * p[k];
+                    z4[2] += prow.ma[k] + s * prow.mb[k];
+                    z4[3] += prow.qaa[k] + s * (2 * prow.qab[k] + s * prow.qbb[k]);
+                }
+            }
+        }
+    }
+
+    /* 第二遍：分区仿射修正后的调色板重判 */
+    if (zn) {
+        zone_delta zd;
+        zd.z = zn;
+        for (int zr = 0; zr < zn; zr++)
+            for (int zc = 0; zc < zn; zc++)
+                for (int k = 0; k < 3; k++) {
+                    double ga = 1.0, gb = bias[k];
+                    int cnt = zc_n[zr][zc];
+                    if (cnt >= ZONE_MIN_CELLS) {
+                        const double *z4 = zs[zr][zc][k];
+                        double mo = z4[0] / cnt, vo = z4[1] / cnt - mo * mo;
+                        double mp = z4[2] / cnt, vp = z4[3] / cnt - mp * mp;
+                        if (vp > 1.0 && vo > 0) {
+                            ga = sqrt(vo / vp);
+                            if (ga < 0.25) ga = 0.25;
+                            if (ga > 2.5) ga = 2.5;
+                            gb = mo - ga * mp;
+                        }
+                    }
+                    zd.d[zr][zc][0][k] = ga;
+                    zd.d[zr][zc][1][k] = gb;
+                }
+        pal_row prow;
+        double zrow[ZONE_MAX][2][3];
+        int cur_r = -1;
+        for (int i = HEADER_CELLS; i < last; i++) {
+            int idx = free_idx[i];
+            int r = idx / n, c = idx % n;
+            double s = (c + 0.5) / n;
+            if (r != cur_r) {
+                double t = (r + 0.5) / n;
+                pal_row_init(&pr.pal, t, vs, nv, &prow);
+                zone_row(&zd, t, zrow);
+                cur_r = r;
+            }
+            int c0, c1;
+            double w;
+            zone_lerp(zn, s, &c0, &c1, &w);
+            double ga[3], gb[3];
+            for (int k = 0; k < 3; k++) {
+                ga[k] = zrow[c0][0][k] * (1 - w) + zrow[c1][0][k] * w;
+                gb[k] = zrow[c0][1][k] * (1 - w) + zrow[c1][1][k] * w;
+            }
+            double ref[8][3];
+            for (int v = 0; v < nv; v++)
+                for (int k = 0; k < 3; k++)
+                    ref[v][k] = ga[k] * (prow.a[v][k] + s * prow.b[v][k]) + gb[k];
+            double conf;
+            cellv[idx] = (uint8_t)classify_ref((const double (*)[3])ref, nv,
+                                               &cellp[(size_t)idx * 3], &conf);
+            celle[idx] = conf < PAL_ERASE ? 1 : 0;
+        }
+    }
+    else {
+        cellv = cellv1;
+        celle = celle1;
+    }
+    if (diag) diag->zones = zn;
+    ms_decide = clk_ms() - t_stage;
+    t_stage = clk_ms();
+
+    /*
+     * 数据格 -> 位流 -> 交织字节 + 字节级擦除标记。
+     *
+     * 分区修正启用时两遍判决各出一条位流：第二遍优先，某块纠不动再拿第一遍
+     * （即改造前的整体偏移判决）的同一块重试。分区修正在局部光照干扰下收益
+     * 很大，但在没有这类干扰的帧上只是把误判挪个位置，个别块会从「刚好纠得动」
+     * 变成「刚好纠不动」；逐块回退保证通过块数不少于改造前。多试一条位流的
+     * 伪成功风险由 RS_ERAS_MAX 留的 8 个复验符号兜住（约 2^-64 量级翻倍）。
+     */
+    const int n_streams = zn ? 2 : 1;
+    uint8_t stream[2][8192];
+    uint8_t seras[2][8192];
+    if (stream_len > (int)sizeof stream[0]) { free(ws); free(free_idx); return VDD_ERR_CAPACITY; }
+    long total_bits = (long)stream_len * 8;
+    int n_bad = stream_len;
+    for (int si = 0; si < n_streams; si++) {
+        const uint8_t *vv = si ? cellv1 : cellv, *ee = si ? celle1 : celle;
+        memset(stream[si], 0, (size_t)stream_len);
+        memset(seras[si], 0, (size_t)stream_len);
+        long bitpos = 0;
+        for (int i = HEADER_CELLS; i < last && bitpos < total_bits; i++) {
+            int idx = free_idx[i];
+            uint8_t v = vv[idx];
+            uint8_t er = ee[idx];
+            for (int b = bpc - 1; b >= 0 && bitpos < total_bits; b--) {
+                if ((v >> b) & 1) stream[si][bitpos >> 3] |= (uint8_t)(0x80 >> (bitpos & 7));
+                if (er) seras[si][bitpos >> 3] = 1;
+                bitpos++;
+            }
+        }
+        int nbad = 0;
+        for (int i = 0; i < stream_len; i++) nbad += seras[si][i];
+        if (nbad < n_bad) n_bad = nbad;
     }
 
     /*
@@ -1775,9 +2293,8 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
      * 格，而能解出的帧只有 8%~11%，两者之间没有交叠。25% 已经远超 RS 的
      * 物理上限（每块 255 字节只有 32 个校验符号），继续跑 13 个块的两轮
      * 纠错纯属浪费，省下的时间直接变成更高的送检帧率。
+     * 大部分这类帧现在已在全采样前被抽样拦下，这里是兜底。两条位流取较好的。
      */
-    int n_bad = 0;
-    for (int i = 0; i < stream_len; i++) n_bad += seras[i];
     if (n_bad > stream_len / 4) {
         /* 与下面的纠错失败出口一致：不动跟踪锁，几何是对的。
            rs_erasures 这里报的是未截断的候选数，读数远超 nb*RS_ERAS_MAX
@@ -1786,14 +2303,7 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
         if (diag) {
             diag->rs_blocks = nb;
             diag->rs_erasures = n_bad;
-        diag->ms_find = ms_find;
-        diag->ms_probe = ms_probe;
-        diag->ms_beta = ms_beta;
-        diag->ms_geom = g_ms_geom;
-        diag->ms_calib = g_ms_calib;
-        diag->ms_sample = ms_sample;
-        diag->ms_decide = ms_decide;
-        diag->ms_rs = ms_rs;
+            set_diag_times(diag, ms_find, ms_probe, ms_beta, ms_sample, ms_decide, ms_rs);
         }
         free(ws); free(free_idx);
         return VDD_ERR_SIGNAL;
@@ -1823,63 +2333,25 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
         diag->rs_corrected = 0;
         diag->rs_erasures = 0;
     }
-    /* 每块交织位置索引：数据段 + 奇偶段 */
     int out_off = 0;
     for (int i = 0; i < nb; i++) {
         int bl = blens[i];
-        int n_eras = 0;
-        int bp = 0;
-        /* 数据字节：第 j 轮的本块槽位 */
-        int pos = 0;
-        for (int j = 0; j < max_len; j++) {
-            for (int k = 0; k < nb; k++) {
-                if (j >= blens[k]) continue;
-                if (k == i) {
-                    block[bp] = stream[pos];
-                    if (seras[pos] && n_eras < RS_ERAS_MAX) eras[n_eras++] = bp;
-                    else if (seras[pos]) { /* 擦除超限则忽略标记，按错误处理 */ }
-                    bp++;
-                }
-                pos++;
-            }
-        }
-        /* 奇偶字节 */
-        for (int j = 0; j < RS_PARITY; j++) {
-            for (int k = 0; k < nb; k++) {
-                if (k == i) {
-                    block[bp] = stream[pos];
-                    if (seras[pos] && n_eras < RS_ERAS_MAX) eras[n_eras++] = bp;
-                    bp++;
-                }
-                pos++;
-            }
-        }
-        /* 擦除标记数按「喂进 RS 的那一次」统计，与置信度门限直接对应 */
-        if (diag) diag->rs_erasures += n_eras;
         int n_fixed = 0;
-        int block_ok = 1;
-        if (rs_errata_decode(block, bl + RS_PARITY, eras, n_eras, &n_fixed) != 0) {
-            /* 擦除信息可能误导；退一步用纯错误模式再试一次 */
-            /* 注意 block 已被就地修改，需要重取 —— 简单起见重新抽取 */
-            int bp2 = 0, pos2 = 0;
-            for (int j = 0; j < max_len; j++) {
-                for (int k = 0; k < nb; k++) {
-                    if (j >= blens[k]) continue;
-                    if (k == i) block[bp2++] = stream[pos2];
-                    pos2++;
-                }
+        int block_ok = 0;
+        for (int si = 0; si < n_streams && !block_ok; si++) {
+            int n_eras = extract_block(stream[si], seras[si], nb, blens, max_len, i, block, eras);
+            /* 擦除标记数按「喂进 RS 的那一次」统计（首选位流），与置信度门限直接对应 */
+            if (si == 0 && diag) diag->rs_erasures += n_eras;
+            if (rs_errata_decode(block, bl + RS_PARITY, eras, n_eras, &n_fixed) == 0) {
+                block_ok = 1;
+                break;
             }
-            for (int j = 0; j < RS_PARITY; j++) {
-                for (int k = 0; k < nb; k++) {
-                    if (k == i) block[bp2++] = stream[pos2];
-                    pos2++;
-                }
-            }
-            if (rs_errata_decode(block, bl + RS_PARITY, NULL, 0, &n_fixed) != 0) {
-                block_ok = 0;
-                rs_failed = 1;
-            }
+            /* 擦除信息可能误导；退一步用纯错误模式再试一次。
+               block 已被就地修改，重新抽取 */
+            extract_block(stream[si], NULL, nb, blens, max_len, i, block, NULL);
+            if (rs_errata_decode(block, bl + RS_PARITY, NULL, 0, &n_fixed) == 0) block_ok = 1;
         }
+        if (!block_ok) rs_failed = 1;
         if (block_ok && diag) {
             diag->rs_blocks_ok++;
             diag->rs_corrected += n_fixed;
@@ -1893,31 +2365,13 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
         /* 不动跟踪锁：几何是对的（头部已过），只是这一帧信噪比不够，
            丢锁反而会让下一帧退回全图搜索 —— 沿用改造前的行为 */
         ms_rs = clk_ms() - t_stage;
-        if (diag) {
-        diag->ms_find = ms_find;
-        diag->ms_probe = ms_probe;
-        diag->ms_beta = ms_beta;
-        diag->ms_geom = g_ms_geom;
-        diag->ms_calib = g_ms_calib;
-        diag->ms_sample = ms_sample;
-        diag->ms_decide = ms_decide;
-        diag->ms_rs = ms_rs;
-        }
+        if (diag) set_diag_times(diag, ms_find, ms_probe, ms_beta, ms_sample, ms_decide, ms_rs);
         free(ws); free(free_idx);
         return VDD_ERR_RS;
     }
 
     ms_rs = clk_ms() - t_stage;
-    if (diag) {
-        diag->ms_find = ms_find;
-        diag->ms_probe = ms_probe;
-        diag->ms_beta = ms_beta;
-        diag->ms_geom = g_ms_geom;
-        diag->ms_calib = g_ms_calib;
-        diag->ms_sample = ms_sample;
-        diag->ms_decide = ms_decide;
-        diag->ms_rs = ms_rs;
-    }
+    if (diag) set_diag_times(diag, ms_find, ms_probe, ms_beta, ms_sample, ms_decide, ms_rs);
 
     if (lock) {
         for (int k = 0; k < 4; k++) {
@@ -1928,6 +2382,13 @@ int vdd_decode_diag(const vdd_image *img, int n_grid, vdd_lock *lock,
         lock->grid = n;              /* 判别出的档位随锁复用，后续帧不再逐个试 */
         lock->orient = used_orient;  /* 朝向同理，避免每帧四选一 */
         lock->valid = 1;
+        /* 重复帧记录：抽样位置上的最终判决值 */
+        lock->dup_grid = n;
+        lock->dup_len = payload_len;
+        lock->dup_colors = colors;
+        lock->dup_n = n_probe;
+        for (int j = 0; j < n_probe; j++)
+            lock->dup_v[j] = cellv[free_idx[HEADER_CELLS + pstep / 2 + j * pstep]];
     }
     free(ws); free(free_idx);
     return payload_len;

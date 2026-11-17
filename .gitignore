@@ -18,9 +18,6 @@ xcuserdata/
 *.xcscmblueprint
 DerivedData/
 
-### Java / Maven ###
-target/
-
 ### Node / Web ###
 node_modules/
 dist/
