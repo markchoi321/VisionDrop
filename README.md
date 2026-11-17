@@ -57,7 +57,7 @@ N=64–128，N=128 档单符号净载荷 5087 字节。每档各自选块大小 
 
 SwiftUI 的 iOS 应用。摄像头连续扫描，多会话并行维护，进度以二进制 `.vdpg` 格式自动落盘并在启动时恢复。
 
-识别管线只有一条（`QrBinary/DenseL1/`），解码核心为零依赖的纯 C99：亮度域游程定位、几何校正、逐格面积平均采样、定标判决、RS errata 纠错，跟踪态 N=96 单帧 0.5ms（30fps 预算 33ms）。相机侧用 BGRA 输出并在稳定后锁定 AE/AWB/对焦——多电平判决最怕的就是相机自动调节带来的光度漂移。该管线不依赖 Vision，**模拟器可跑全流程回归**。详见 [receiver/QrBinary/DenseL1/README.md](receiver/QrBinary/DenseL1/README.md)。
+识别管线只有一条（`VisionDrop/DenseL1/`），解码核心为零依赖的纯 C99：亮度域游程定位、几何校正、逐格面积平均采样、定标判决、RS errata 纠错，跟踪态 N=96 单帧 0.5ms（30fps 预算 33ms）。相机侧用 BGRA 输出并在稳定后锁定 AE/AWB/对焦——多电平判决最怕的就是相机自动调节带来的光度漂移。该管线不依赖 Vision，**模拟器可跑全流程回归**。详见 [receiver/VisionDrop/DenseL1/README.md](receiver/VisionDrop/DenseL1/README.md)。
 
 扫描帧率上限 60fps。超过 30fps 需显式选择支持高帧率的 `activeFormat`（`sessionPreset` 隐含 30fps 上限）。这直接放宽了发送端的显示间隔下限：按 `N = 间隔 × 帧率 / 1000 ≥ 2.5`，30fps 对应 83ms，60fps 对应 42ms。
 
@@ -72,8 +72,8 @@ python3 protocol/refimpl.py check                      # 参考实现自检
 node sender/web/test/run-vectors.js                    # Web 发送端 L2–L5 向量比对
 node sender/web/test/run-dense-vectors.js              # Web 发送端 L1（VD-D1）向量比对
 python3 protocol/dense/dense_refimpl.py check          # 密集色块码参考实现自检（8 色与 4 色）
-xcodebuild test -project receiver/QrBinary.xcodeproj \
-  -scheme QrBinary -destination 'platform=iOS Simulator,name=iPhone 17'
+xcodebuild test -project receiver/VisionDrop.xcodeproj \
+  -scheme VisionDrop -destination 'platform=iOS Simulator,name=iPhone 17'
 ```
 
 两端各自比对 `protocol/vectors/` 下的全部向量（PRNG、量化度分布、邻居集合、系数向量、选参、档位、整帧字节、raw deflate 往返），并各自跑 0/10/30/50% 丢帧的端到端还原与 SHA-256 校验。
@@ -89,7 +89,7 @@ python3 protocol/crosscheck.py <dump> --sha <原始文件sha256>
 ## 待办
 
 - 识别率标定（设计文档 11.1）：档位扫描 + 显示尺寸，决定 720p / 1080p 各自的可用档位上限
-- 密集 8 色模式：真机信道标定；给格式补内部校正图形（替掉现在从边缘外推畸变的权宜做法）；档位 N 写进符号头部。解码核心与相机管线已完成，见 [receiver/QrBinary/DenseL1/README.md](receiver/QrBinary/DenseL1/README.md)
+- 密集 8 色模式：真机信道标定；给格式补内部校正图形（替掉现在从边缘外推畸变的权宜做法）；档位 N 写进符号头部。解码核心与相机管线已完成，见 [receiver/VisionDrop/DenseL1/README.md](receiver/VisionDrop/DenseL1/README.md)
 
 ## 历史说明
 

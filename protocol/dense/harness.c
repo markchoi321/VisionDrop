@@ -7,7 +7,7 @@
  *
  * 编译：
  *   clang -O2 -std=c99 -o vddh protocol/dense/harness.c \
- *         receiver/QrBinary/DenseL1/vd_dense_core.c -lm
+ *         receiver/VisionDrop/DenseL1/vd_dense_core.c -lm
  *
  * 用法：
  *   ./vddh [-r 次数] [-l] [-x] <图.bmp> [更多.bmp ...]
@@ -34,7 +34,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "../../receiver/QrBinary/DenseL1/vd_dense_core.h"
+#include "../../receiver/VisionDrop/DenseL1/vd_dense_core.h"
 
 /* 读 24 位 BMP 到紧凑 RGB24。只认最常见的那一种：无压缩、bpp=24。 */
 static uint8_t *load_bmp(const char *path, int *out_w, int *out_h) {

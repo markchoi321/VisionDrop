@@ -3,7 +3,7 @@
 
 金图像是「真实 L2 帧 -> VD-D1 符号 -> 渲染 -> 光度/几何失真」的产物，
 权威副本写在 protocol/dense/golden/，测试副本在
-receiver/QrBinaryTests/vectors/dense/，由 Xcode 的 "Verify Protocol Vectors"
+receiver/VisionDropTests/vectors/dense/，由 Xcode 的 "Verify Protocol Vectors"
 构建阶段校验两份一致。
 
 用法：
@@ -24,7 +24,7 @@ import dense_refimpl as D
 import refimpl as R
 
 GOLDEN = os.path.join(HERE, "golden")
-MIRROR = os.path.join(HERE, "..", "..", "receiver", "QrBinaryTests", "vectors", "dense")
+MIRROR = os.path.join(HERE, "..", "..", "receiver", "VisionDropTests", "vectors", "dense")
 
 # (名字, N, baseBlockId, 构造函数[, 色数])。构造函数接收 cells 与 N，返回图像。
 # 色数缺省 8；4 色金图像的文件名带 _4c，清单格式不变（解码端从头部读色数）。

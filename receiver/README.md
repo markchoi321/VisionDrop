@@ -1,9 +1,9 @@
-# QrBinary（VisionDrop 接收端）
+# VisionDrop 接收端
 
 iOS 端文件接收器：摄像头连续扫描发送端滚动播放的密集 8 色色块码（VD-D1）序列，
 按喷泉码重组出原始二进制文件。
 
-识别管线与解码核心见 [QrBinary/DenseL1/README.md](QrBinary/DenseL1/README.md)，
+识别管线与解码核心见 [VisionDrop/DenseL1/README.md](VisionDrop/DenseL1/README.md)，
 协议语义见 [../protocol/CONTRACT.md](../protocol/CONTRACT.md)。本文件只讲**采集侧的参数选择**。
 
 ## 扫描设置

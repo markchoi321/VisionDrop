@@ -105,7 +105,7 @@ T，与 `refimpl.py` 对不上。
   视口重建布局。没有 Fullscreen API 的浏览器（IE10）隐藏该按钮。页面本身也是
   纯白底，符号外围不再有灰底与边线。
 
-接收端已实现（`receiver/QrBinary/DenseL1/`），真机屏摄可整帧解出。
+接收端已实现（`receiver/VisionDrop/DenseL1/`），真机屏摄可整帧解出。
 发送语义由 `protocol/dense/dense_refimpl.py` 的图像解码器验收：JS 编码器
 渲染的符号在 gamma/白平衡/噪声/透视失真下解码，经喷泉码还原文件 SHA-256 一致。
 
